@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { contextForCwd, type AdapterContext } from "./context";
@@ -8,6 +8,9 @@ import { reviewDue, type ReviewResult } from "./review";
 
 const STARTUP_LIMIT = 6000;
 const REVIEW_TIMEOUT_MS = 2000;
+const REVIEW_FAILURE_FILE = "review-failure.json";
+const REVIEW_RETRY_BASE_MS = 60_000;
+const REVIEW_RETRY_MAX_MS = 3_600_000;
 const STALE_DAYS = 30;
 const CURATED_KINDS = new Set(["preference", "preferences", "correction", "identity"]);
 const PROJECT_KINDS = new Set(["handoff", "project_handoff", "note", "project_note", "relevant"]);
@@ -66,6 +69,13 @@ interface RawRow {
 	valid_until?: unknown;
 	superseded_by?: unknown;
 	[key: string]: unknown;
+}
+
+interface ReviewFailureState {
+	readonly attempts: number;
+	readonly failedAt: string;
+	readonly retryAt: string;
+	readonly error?: string;
 }
 
 function nowValue(value: SessionStartOptions["now"]): Date {
@@ -290,6 +300,58 @@ function reviewDueStatus(context: AdapterContext, now: Date, dueDays = 7): strin
 	return age >= dueDays ? `REVIEW STATUS: due (age_days=${age.toFixed(1)} due_days=${dueDays})` : `REVIEW STATUS: not_due (age_days=${age.toFixed(1)} due_days=${dueDays})`;
 }
 
+function reviewFailurePath(context: AdapterContext): string {
+	return path.join(context.dataDir, ".adapter-review", REVIEW_FAILURE_FILE);
+}
+
+function readReviewFailure(context: AdapterContext): ReviewFailureState | undefined {
+	try {
+		const file = reviewFailurePath(context);
+		const info = lstatSync(file);
+		if (!info.isFile() || (typeof process.getuid === "function" && info.uid !== process.getuid()) || (info.mode & 0o077) !== 0) return undefined;
+		const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const state = parsed as Partial<ReviewFailureState>;
+		if (!Number.isInteger(state.attempts) || state.attempts < 1 || typeof state.failedAt !== "string" || typeof state.retryAt !== "string") return undefined;
+		if (!Number.isFinite(Date.parse(state.failedAt)) || !Number.isFinite(Date.parse(state.retryAt))) return undefined;
+		return { attempts: state.attempts, failedAt: state.failedAt, retryAt: state.retryAt, ...(typeof state.error === "string" ? { error: state.error } : {}) };
+	} catch {
+		return undefined;
+	}
+}
+
+function retryDelayMs(attempts: number): number {
+	return Math.min(REVIEW_RETRY_MAX_MS, REVIEW_RETRY_BASE_MS * 2 ** Math.min(10, Math.max(0, attempts - 1)));
+}
+
+function recordReviewFailure(context: AdapterContext, now: Date, error: string): ReviewFailureState | undefined {
+	try {
+		const directory = path.dirname(reviewFailurePath(context));
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		const existing = readReviewFailure(context);
+		const attempts = (existing?.attempts ?? 0) + 1;
+		const failedAt = now.toISOString();
+		const state: ReviewFailureState = {
+			attempts,
+			failedAt,
+			retryAt: new Date(now.getTime() + retryDelayMs(attempts)).toISOString(),
+			error: error.slice(0, 1000),
+		};
+		const target = reviewFailurePath(context);
+		const temporary = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+		writeFileSync(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+		chmodSync(temporary, 0o600);
+		renameSync(temporary, target);
+		return state;
+	} catch {
+		return undefined;
+	}
+}
+
+function clearReviewFailure(context: AdapterContext): void {
+	try { unlinkSync(reviewFailurePath(context)); } catch { /* no marker or best effort */ }
+}
+
 async function boundedReview(context: AdapterContext, now: Date, dueDays: number): Promise<ReviewResult | { status: "timeout"; error: string }> {
 	const reviewDir = path.join(context.dataDir, ".adapter-review");
 	const before = new Set<string>();
@@ -371,15 +433,28 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	let reviewNote = reviewDueStatus(context, now);
 	const due = reviewDue(context.cwd, 7, { context, now });
 	if (due.status === "due") {
-		const sweep = await boundedReview(context, now, 7);
-		if (sweep.status === "timeout") {
-			errors.push(`${sweep.error}; no automatic completion claim`);
-			reviewNote = `REVIEW STATUS: due (bounded sweep failed; prior snapshot retained)`;
-		} else if (sweep.status !== "ok") {
-			errors.push(`review sweep failed: ${sweep.error ?? "unknown error"}`);
-			reviewNote = `REVIEW STATUS: due (sweep failed; prior snapshot retained)`;
+		const failure = readReviewFailure(context);
+		const retryAt = failure ? Date.parse(failure.retryAt) : Number.NaN;
+		if (failure && Number.isFinite(retryAt) && retryAt > now.getTime()) {
+			reviewNote = `REVIEW STATUS: due (retry deferred after failed sweep; retry_at=${failure.retryAt} attempts=${failure.attempts})`;
 		} else {
-			reviewNote = `REVIEW STATUS: sweep completed (added=${sweep.report.added.length} changed=${sweep.report.changed.length} missing=${sweep.report.missing.length} stale=${sweep.report.stale.length} duplicate=${sweep.report.duplicates.length} expired=${sweep.report.expired.length} superseded=${sweep.report.superseded.length} unresolved_imports=${sweep.report.unresolvedImports.length})`;
+			const sweep = await boundedReview(context, now, 7);
+			if (sweep.status === "timeout") {
+				const recorded = recordReviewFailure(context, now, sweep.error);
+				errors.push(`${sweep.error}; no automatic completion claim`);
+				reviewNote = recorded
+					? `REVIEW STATUS: due (bounded sweep failed; retry_at=${recorded.retryAt}; prior snapshot retained)`
+					: `REVIEW STATUS: due (bounded sweep failed; prior snapshot retained)`;
+			} else if (sweep.status !== "ok") {
+				const recorded = recordReviewFailure(context, now, sweep.error ?? "unknown error");
+				errors.push(`review sweep failed: ${sweep.error ?? "unknown error"}`);
+				reviewNote = recorded
+					? `REVIEW STATUS: due (sweep failed; retry_at=${recorded.retryAt}; prior snapshot retained)`
+					: `REVIEW STATUS: due (sweep failed; prior snapshot retained)`;
+			} else {
+				clearReviewFailure(context);
+				reviewNote = `REVIEW STATUS: sweep completed (added=${sweep.report.added.length} changed=${sweep.report.changed.length} missing=${sweep.report.missing.length} stale=${sweep.report.stale.length} duplicate=${sweep.report.duplicates.length} expired=${sweep.report.expired.length} superseded=${sweep.report.superseded.length} unresolved_imports=${sweep.report.unresolvedImports.length})`;
+			}
 		}
 	}
 	const systemMessage = errors.length > 0

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { review, reviewDue } from "../src/review";
-import { sessionStart } from "../src/session-start";
+import { sessionStart, startupDbPath } from "../src/session-start";
 import type { AdapterContext } from "../src/context";
 import { selectInjectableRecall, type RecallCandidate } from "../src/reliability/policy";
 
@@ -57,6 +57,17 @@ function add(fx: Fixture, id: string, content: string, metadata: Record<string, 
 }
 
 describe("SessionStart bounded metadata recall", () => {
+	it("keeps project-bank paths in the data directory banks namespace", () => {
+		const fx = fixture();
+		try {
+			const projectBank = "hautoworks-abc123";
+			const resolved = startupDbPath(fx.context, projectBank);
+			expect(resolved).toBe(path.join(fx.context.dataDir, "banks", projectBank, "mnemopi.db"));
+			expect(resolved).not.toBe(path.join(fx.context.dataDir, projectBank, "mnemopi.db"));
+			expect(existsSync(path.join(fx.context.dataDir, projectBank))).toBe(false);
+		} finally { close(fx); }
+	});
+
 	it("emits the verified hook shape and only curated metadata rows", async () => {
 		const fx = fixture();
 		try {
@@ -151,6 +162,25 @@ describe("SessionStart bounded metadata recall", () => {
 			const context = output.hookSpecificOutput.additionalContext;
 			expect(context).toContain("path-match");
 			expect(context).not.toContain("unrelated");
+		} finally { close(fx); }
+	});
+
+	it("backs off repeated failed review sweeps without creating a successful snapshot", async () => {
+		const fx = fixture();
+		try {
+			fx.db.exec("DROP TABLE episodic_memory");
+			const now = new Date("2026-09-10T00:00:00.000Z");
+			const first = await sessionStart(fx.root, { context: fx.context, now });
+			expect(first.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (sweep failed");
+			const reviewDir = path.join(fx.context.dataDir, ".adapter-review");
+			expect(readdirSync(reviewDir).filter(name => name.startsWith("snapshot-")).length).toBe(0);
+
+			const second = await sessionStart(fx.root, { context: fx.context, now });
+			expect(second.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (retry deferred");
+			expect(readdirSync(reviewDir).filter(name => name.startsWith("snapshot-")).length).toBe(0);
+			const failure = JSON.parse(readFileSync(path.join(reviewDir, "review-failure.json"), "utf8")) as { attempts: number; retryAt: string };
+			expect(failure.attempts).toBe(1);
+			expect(Date.parse(failure.retryAt)).toBeGreaterThan(now.getTime());
 		} finally { close(fx); }
 	});
 });
