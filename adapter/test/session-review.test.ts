@@ -126,6 +126,32 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("surfaces a safe diagnostic when SQL filtering falls back to the bounded query", async () => {
+		const fx = fixture();
+		let forcedFailure = false;
+		try {
+			add(fx, "fallback-pref", "fallback preference", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
+			const output = await sessionStart(fx.root, {
+				context: fx.context,
+				now: new Date("2026-09-10T00:00:00.000Z"),
+				startupQueryExecutor: (db, sql, params, phase) => {
+					if (phase === "filtered" && !forcedFailure) {
+						forcedFailure = true;
+						throw new Error("forced SQL predicate failure with row content that must not surface");
+					}
+					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
+				},
+			});
+			const context = output.hookSpecificOutput.additionalContext;
+			expect(forcedFailure).toBe(true);
+			expect(output.systemMessage).toContain("STARTUP SQL FILTER FALLBACK: bank=default table=working_memory");
+			expect(output.systemMessage).not.toContain("forced SQL predicate failure");
+			expect(context).toContain("STARTUP RECALL DEGRADED");
+			expect(context).toContain("STARTUP SQL FILTER FALLBACK: bank=default table=working_memory");
+			expect(context).toContain("fallback preference");
+		} finally { close(fx); }
+	});
+
 	it("chooses newest handoff for a task key and labels the omitted stale handoff", async () => {
 		const fx = fixture();
 		try {
