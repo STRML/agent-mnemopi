@@ -1,0 +1,32 @@
+Upstream: can1357/oh-my-pi
+Commit: d9aa759dc54ae138c4b05639bf41c75f6c51e014
+Package: @oh-my-pi/pi-mnemopi 18.0.11
+
+This is the intentional adapter delta applied to the vendored
+`src/vendor/mnemopi/mcp-tools.ts`:
+
+```diff
+@@ tool schemas and dispatch @@
++Require an explicit non-empty `bank` on adapter calls.
++Expose only mnemopi_remember, mnemopi_recall, mnemopi_get,
++mnemopi_update, mnemopi_invalidate, and mnemopi_stats.
++Require bank in remember/recall/get/update/invalidate schemas.
+
+@@ database and session selection @@
++Use MNEMOPI_BASE_DB_PATH for the configured base bank.
++Use session_id == channel_id == bank so native OMP rows are visible.
++Construct BeamMemory with config.workingMemoryLimit = 0.
+
+@@ durable remember @@
+-Default scope: session.
++Default scope: bank.
++Set trustTier: IMPORTED.
++Return exact persisted content in the result.
+
+@@ error semantics @@
++Return structured memory_not_found errors for get/update/invalidate misses.
+```
+
+The full vendored file is the authoritative implementation; this note keeps
+the provenance and behavioral boundary reviewable without requiring the OMP
+checkout at runtime.
