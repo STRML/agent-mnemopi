@@ -64,6 +64,23 @@ describe("reliability policy", () => {
 		expect(raw.score_is_not_confidence).toBe(true);
 	});
 
+	it("ignores stopwords and requires token boundaries for lexical evidence", () => {
+		const stopwordSubstring = { id: "stopword-substring", content: "listing existing context", keyword_score: 0.4 };
+		const startupBoilerplate = { id: "startup-boilerplate", content: "session startup checklist", keyword_score: 0.4 };
+		const pathPrefix = { id: "path-prefix", content: "handoff for /workspace/project-old", keyword_score: 0.4 };
+		const pathMatch = { id: "path-match", content: "handoff for /workspace/project", keyword_score: 0.4 };
+
+		expect(selectInjectableRecall("this list exists", [stopwordSubstring])).toEqual({
+			status: "abstained",
+			reason: "no_query_specific_evidence",
+			results: [],
+		});
+		expect(selectInjectableRecall("session startup /workspace/project", [startupBoilerplate, pathPrefix, pathMatch])).toMatchObject({
+			status: "selected",
+			results: [{ id: "path-match", evidence: "query_lexical", evidence_label: "query_lexical" }],
+		});
+	});
+
 	it("reports missing stores without creating them", () => {
 		const root = mkdtempSync(join(tmpdir(), "mnemopi-policy-"));
 		const path = join(root, "missing.db");

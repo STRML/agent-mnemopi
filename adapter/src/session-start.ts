@@ -22,6 +22,10 @@ export interface StartupMemory {
 	readonly kind?: string;
 	readonly taskKey?: string;
 	readonly evidence: "metadata" | "lexical" | "fts" | "callback" | "metadata_exact" | "query_lexical";
+	/** Recall scores are retained internally so the startup evidence gate can inspect callback provenance. */
+	readonly keyword_score?: number;
+	readonly fts_score?: number;
+	readonly dense_score?: number;
 	readonly stale: boolean;
 	readonly ageDays: number | null;
 }
@@ -202,7 +206,21 @@ function callbackRows(value: unknown, bank: string, now: Date): StartupMemory[] 
 		const age = ageDays(text(row.timestamp), now);
 		const evidenceLabel = text(row.evidence_label);
 		const evidence = evidenceLabel === "metadata_exact" || evidenceLabel === "query_lexical" ? evidenceLabel : "callback";
-		return [{ id, content, bank, source: text(row.source) || null, timestamp: text(row.timestamp) || null, metadata, kind: kindOf(metadata, row) || undefined, evidence, stale: age !== null && age >= STALE_DAYS, ageDays: age }];
+		return [{
+			id,
+			content,
+			bank,
+			source: text(row.source) || null,
+			timestamp: text(row.timestamp) || null,
+			metadata,
+			kind: kindOf(metadata, row) || undefined,
+			evidence,
+			keyword_score: typeof row.keyword_score === "number" ? row.keyword_score : undefined,
+			fts_score: typeof row.fts_score === "number" ? row.fts_score : undefined,
+			dense_score: typeof row.dense_score === "number" ? row.dense_score : undefined,
+			stale: age !== null && age >= STALE_DAYS,
+			ageDays: age,
+		}];
 	});
 }
 

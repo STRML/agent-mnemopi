@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { review, reviewDue } from "../src/review";
 import { sessionStart } from "../src/session-start";
 import type { AdapterContext } from "../src/context";
+import { selectInjectableRecall, type RecallCandidate } from "../src/reliability/policy";
 
 interface Fixture {
 	root: string;
@@ -127,6 +128,29 @@ describe("SessionStart bounded metadata recall", () => {
 			const output = await sessionStart(fx.root, { context: fx.context, maxChars: 256 });
 			expect(output.hookSpecificOutput.additionalContext.length).toBeLessThanOrEqual(256);
 			expect(output.hookSpecificOutput.additionalContext).toContain("TRUNCATED");
+		} finally { close(fx); }
+	});
+
+	it("keeps callback startup recall scoped to the concrete project path", async () => {
+		const fx = fixture();
+		let callbackQuery = "";
+		try {
+			const output = await sessionStart(fx.root, {
+				context: fx.context,
+				now: new Date("2026-09-10T00:00:00.000Z"),
+				recall: () => [
+					{ id: "unrelated", content: "session startup checklist", keyword_score: 0.4 },
+					{ id: "path-match", content: `handoff for ${fx.root}`, keyword_score: 0.4 },
+				],
+				selectInjectableRecall: (query, results) => {
+					callbackQuery = query;
+					return selectInjectableRecall(query, results as RecallCandidate[]);
+				},
+			});
+			expect(callbackQuery).toBe(`session startup ${fx.root}`);
+			const context = output.hookSpecificOutput.additionalContext;
+			expect(context).toContain("path-match");
+			expect(context).not.toContain("unrelated");
 		} finally { close(fx); }
 	});
 });

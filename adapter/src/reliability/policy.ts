@@ -134,6 +134,15 @@ export function prepareMutationStore(bank: string): MutationStore {
 
 export type RecallCandidate = Record<string, unknown> & { readonly id: string };
 export type RecallEvidence = "metadata_exact" | "query_lexical" | "dense_only" | "no_query_evidence";
+// Recall callbacks may prepend natural-language framing (for example,
+// "session startup") to a concrete project path. These words should not be
+// allowed to turn a positive lexical score into evidence by themselves.
+const LEXICAL_STOPWORDS = new Set([
+	"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in", "is", "it", "its",
+	"of", "on", "or", "that", "the", "their", "there", "this", "to", "was", "were", "with", "you", "your",
+	"exists", "list", "session", "startup",
+]);
+
 function metadataValue(result: RecallCandidate, key: "task_key" | "cwd"): string | undefined {
 	const direct = result[key];
 	if (typeof direct === "string") return direct;
@@ -152,13 +161,37 @@ function metadataValue(result: RecallCandidate, key: "task_key" | "cwd"): string
 	}
 	return undefined;
 }
+
+function queryTokens(query: string): string[] {
+	return query.toLowerCase().split(/[^a-z0-9_/-]+/).filter(token => token.length > 1 && !LEXICAL_STOPWORDS.has(token));
+}
+
+function isTokenCharacter(value: string | undefined): boolean {
+	return value !== undefined && /[a-z0-9_/-]/i.test(value);
+}
+
+/** Match a query token as a complete token, not as a substring of another word/path. */
+function hasTokenBoundary(text: string, token: string): boolean {
+	let offset = 0;
+	while (offset < text.length) {
+		const index = text.indexOf(token, offset);
+		if (index < 0) return false;
+		const before = index > 0 ? text[index - 1] : undefined;
+		const afterIndex = index + token.length;
+		const after = afterIndex < text.length ? text[afterIndex] : undefined;
+		if (!isTokenCharacter(before) && !isTokenCharacter(after)) return true;
+		offset = index + 1;
+	}
+	return false;
+}
+
 function evidenceFor(query: string, result: RecallCandidate): RecallEvidence {
 	if (query.length > 0 && (["task_key", "cwd"] as const).some(key => metadataValue(result, key) === query)) return "metadata_exact";
 	const keyword = typeof result.keyword_score === "number" && Number.isFinite(result.keyword_score) && result.keyword_score > 0;
 	const fts = typeof result.fts_score === "number" && Number.isFinite(result.fts_score) && result.fts_score > 0;
 	const text = typeof result.content === "string" ? result.content.toLocaleLowerCase() : typeof result.embed_text === "string" ? result.embed_text.toLocaleLowerCase() : "";
-	const tokens = query.toLocaleLowerCase().split(/[^a-z0-9_/-]+/).filter(token => token.length > 1);
-	const queryTextMatch = tokens.length > 0 && tokens.some(token => text.includes(token));
+	const tokens = queryTokens(query);
+	const queryTextMatch = tokens.length > 0 && tokens.some(token => hasTokenBoundary(text, token));
 	if ((keyword || fts) && queryTextMatch) return "query_lexical";
 	if (typeof result.dense_score === "number" && Number.isFinite(result.dense_score) && result.dense_score > 0) return "dense_only";
 	return "no_query_evidence";
