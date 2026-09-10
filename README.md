@@ -46,7 +46,10 @@ database. It bounds injected context and reports omitted or stale notes. A due
 review runs automatically at startup on its weekly schedule by default. It is
 read-only, does not prune or repair memories, and publishes a private full-text
 snapshot only after successful completion; the explicit `review` command is also
-available.
+available. Startup filters curated rows in SQLite before loading them, keeps a
+one-year timestamp window (while retaining null or malformed timestamps for
+safe classification), and backs off failed review sweeps from one minute up to
+one hour instead of retrying every session.
 
 The installer is opt-in and never grants blanket hook trust:
 

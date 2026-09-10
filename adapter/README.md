@@ -46,7 +46,9 @@ bounded and labels stale or omitted notes; it does not write the OMP database.
 Each startup checks the weekly review schedule and, when due, runs a bounded
 read-only review automatically. A private full-text snapshot is published only
 after successful completion; the explicit `review` command remains available.
-Review does not prune or repair memories.
+Review does not prune or repair memories. Startup pushes its metadata and
+timestamp filters into SQLite, keeps a one-year timestamp window, and records
+failed review attempts with bounded exponential retry backoff.
 
 `context` is read-only and resolves OMP global/project settings, the native
 bank scope, exact DB path, and the OMP embedding model. `mcp` and `call` set
