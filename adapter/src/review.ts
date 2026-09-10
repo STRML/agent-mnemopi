@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { contextForCwd, type AdapterContext } from "./context";
+import { resolveBankDbPath } from "./reliability/bank-path";
 import { journalPath as configuredJournalPath } from "./reliability/journal";
 
 const SNAPSHOT_DIR = ".adapter-review";
@@ -284,9 +285,7 @@ function dedupeBanks(context: AdapterContext): string[] {
 }
 
 function dbPathForBank(context: AdapterContext, bank: string): string {
-	if (bank === context.baseBank) return context.dbPath;
-	if (bank === "default") return path.join(context.dataDir, "mnemopi.db");
-	return path.join(context.dataDir, "banks", bank, "mnemopi.db");
+	return resolveBankDbPath({ dataDir: context.dataDir, baseBank: context.baseBank, baseDbPath: context.dbPath }, bank);
 }
 
 function emptyReport(banks: readonly string[], journalGapsValue: readonly JournalGap[] = []): ReviewResult["report"] {
