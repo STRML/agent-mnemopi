@@ -65,6 +65,7 @@ interface BankRead {
 	readonly bank: string;
 	readonly dbPath: string;
 	readonly rows: StartupMemory[];
+	readonly notes?: string[];
 	readonly error?: string;
 }
 
@@ -200,7 +201,6 @@ function startupQuery(
 	columns: Set<string>,
 	bank: string,
 	globalBank: string,
-	projectRoot: string,
 	now: Date,
 ): { sql: string; params: unknown[] } {
 	// Use guarded JSON extraction so one malformed metadata blob cannot turn a
@@ -217,31 +217,73 @@ function startupQuery(
 	const globalKind = `${kind} IN ('preference', 'preferences', 'correction', 'identity')`;
 	const projectKind = `${kind} IN ('handoff', 'project_handoff', 'note', 'project_note', 'relevant') OR ${taskKey} <> ''`;
 	const globalScope = bank === globalBank ? "1 = 1" : `${json("$.global")} = 1`;
-	const conditions = [
-		`((${globalScope} AND ${globalKind}) OR (${cwd} = ? AND (${projectKind})))`,
-	];
+	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
+	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
+	// cwd as a project candidate and let rowToMemory perform the authoritative
+	// path comparison. This is intentionally conservative: unrelated project
+	// rows may be read, but they are bounded below and discarded before output.
+	const projectScope = `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${projectKind}))`;
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
-	const params: unknown[] = [projectRoot];
-	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
-	// Future-dated rows are not valid evidence for this startup instant. Null
-	// timestamps retain the historical behavior and are still age=unknown.
+	const params: unknown[] = [];
+	let conditions: string[];
 	if (columns.has("timestamp")) {
-		// Keep malformed/legacy timestamp strings for JS's Date.parse handling;
-		// only apply the bounded window to timestamps SQLite can parse.
-		conditions.push("(timestamp IS NULL OR datetime(timestamp) IS NULL OR (datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)))");
-		params.push(cutoff, now.toISOString());
+		// Global curated preferences/corrections/identities are durable policy;
+		// retain old and malformed-timestamp rows, but never admit future rows.
+		// Project-scoped rows remain bounded to the startup lookback window.
+		const globalTime = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
+		const projectTime = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
+		conditions = [`((${globalScope} AND ${globalKind} AND ${globalTime}) OR (${projectScope} AND ${projectTime}))`];
+		params.push(now.toISOString(), cutoff, now.toISOString());
+	} else {
+		conditions = [`((${globalScope} AND ${globalKind}) OR ${projectScope})`];
 	}
+	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
 	return { sql: `SELECT * FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
 }
 
-function fallbackQuery(table: string, columns: Set<string>, now: Date): { sql: string; params: unknown[] } {
-	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
-	const timestamp = columns.has("timestamp") ? " WHERE timestamp IS NULL OR datetime(timestamp) IS NULL OR (datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))" : "";
-	const params: unknown[] = columns.has("timestamp") ? [cutoff, now.toISOString()] : [];
-	params.push(SQL_FALLBACK_ROW_LIMIT);
+function fallbackQuery(table: string, columns: Set<string>): { sql: string; params: unknown[] } {
+	// Without JSON1 we cannot distinguish durable global rows from project
+	// rows. Keep the compatibility path bounded and report any cap omission;
+	// rowToMemory still applies the same JS curation rules. This path is rare,
+	// and the diagnostic makes its conservative loss visible to the host.
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	return { sql: `SELECT * FROM ${table}${timestamp} ORDER BY ${order} LIMIT ?`, params };
+	return { sql: `SELECT * FROM ${table} ORDER BY ${order} LIMIT ?`, params: [SQL_FALLBACK_ROW_LIMIT] };
+}
+
+function fallbackOmissionCount(db: Database, table: string): number {
+	try {
+		const result = db.query(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count?: unknown } | null;
+		const count = Number(result?.count ?? 0);
+		return Number.isFinite(count) ? Math.max(0, count - SQL_FALLBACK_ROW_LIMIT) : 0;
+	} catch {
+		return 0;
+	}
+}
+
+function boundedProjectOmissionCount(db: Database, table: string, columns: Set<string>, now: Date): number {
+	if (!columns.has("timestamp") || !columns.has("metadata_json")) return 0;
+	const metadata = "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END";
+	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
+	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
+	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
+	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
+	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
+	const projectKind = `${kind} IN ('handoff', 'project_handoff', 'note', 'project_note', 'relevant') OR ${taskKey} <> ''`;
+	const projectScope = `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${projectKind}))`;
+	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
+	const conditions = [
+		projectScope,
+		"(datetime(timestamp) IS NULL OR datetime(timestamp) < datetime(?) OR datetime(timestamp) > datetime(?))",
+	];
+	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
+	try {
+		const result = db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${conditions.join(" AND ")}`).get(cutoff, now.toISOString()) as { count?: unknown } | null;
+		const count = Number(result?.count ?? 0);
+		return Number.isFinite(count) ? count : 0;
+	} catch {
+		return 0;
+	}
 }
 
 function readBank(bank: string, dbPath: string, globalBank: string, projectRoot: string, now: Date, canonical: boolean): BankRead {
@@ -255,20 +297,25 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 		const db = new Database(dbPath, { readonly: true });
 		try {
 			const rows: RawRow[] = [];
+			const notes: string[] = [];
 			for (const table of ["working_memory", "episodic_memory"] as const) {
 				const columns = tableColumns(db, table);
-				const query = startupQuery(table, columns, bank, globalBank, projectRoot, now);
+				const query = startupQuery(table, columns, bank, globalBank, now);
 				try {
 					rows.push(...db.query(query.sql).all(...query.params) as RawRow[]);
 				} catch {
 					// JSON1 is available in current SQLite, but old stores may be
-					// opened by a runtime without it. Keep startup bounded and let
-					// rowToMemory preserve the existing JS filtering semantics.
-					const fallback = fallbackQuery(table, columns, now);
+					// opened by a runtime without it. Use the bounded compatibility
+					// query; any cap omission is surfaced in startup diagnostics.
+					const fallback = fallbackQuery(table, columns);
 					rows.push(...db.query(fallback.sql).all(...fallback.params) as RawRow[]);
+					const omitted = fallbackOmissionCount(db, table);
+					if (omitted > 0) notes.push(`STARTUP COMPATIBILITY ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; SQLite JSON filtering was unavailable and the ${SQL_FALLBACK_ROW_LIMIT}-row safety cap applied`);
 				}
+				const omitted = boundedProjectOmissionCount(db, table, columns, now);
+				if (omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
 			}
-			return { bank, dbPath, rows: rows.map(row => rowToMemory(row, bank, globalBank, projectRoot, now)).filter((row): row is StartupMemory => row !== null) };
+			return { bank, dbPath, rows: rows.map(row => rowToMemory(row, bank, globalBank, projectRoot, now)).filter((row): row is StartupMemory => row !== null), notes };
 		} finally {
 			db.close();
 		}
@@ -481,11 +528,13 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	const banks = [...new Set([context.globalBank, ...context.recallBanks])];
 	const reads: BankRead[] = [];
 	const errors: string[] = [];
+	const readNotes: string[] = [];
 	const allRows: StartupMemory[] = [];
 	for (const bank of banks) {
 		const read = readBank(bank, dbPathForBank(context, bank), context.globalBank, projectRoot, now, bank === context.baseBank);
 		reads.push(read);
 		if (read.error) errors.push(`${read.error} bank=${bank} dbPath=${read.dbPath} configFiles=${context.configFiles.join(",") || "(none)"}`);
+		readNotes.push(...(read.notes ?? []));
 		allRows.push(...read.rows);
 		if (options.recall && !read.error) {
 			try {
@@ -539,7 +588,7 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 		...(systemMessage ? { systemMessage } : {}),
 		hookSpecificOutput: {
 			hookEventName: "SessionStart",
-			additionalContext: formatContext(rows, [reviewNote, ...notes], Math.min(STARTUP_LIMIT, Math.max(256, options.maxChars ?? STARTUP_LIMIT)), status),
+			additionalContext: formatContext(rows, [reviewNote, ...readNotes, ...notes], Math.min(STARTUP_LIMIT, Math.max(256, options.maxChars ?? STARTUP_LIMIT)), status),
 		},
 	};
 }

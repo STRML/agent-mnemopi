@@ -47,9 +47,12 @@ review runs automatically at startup on its weekly schedule by default. It is
 read-only, does not prune or repair memories, and publishes a private full-text
 snapshot only after successful completion; the explicit `review` command is also
 available. Startup filters curated rows in SQLite before loading them, keeps a
-one-year timestamp window (while retaining null or malformed timestamps for
-safe classification), and backs off failed review sweeps from one minute up to
-one hour instead of retrying every session.
+one-year timestamp window for project-scoped rows (while retaining durable
+global preferences, corrections, and identities plus null or malformed
+timestamps for safe classification), and backs off failed review sweeps from
+one minute up to one hour instead of retrying every session. If a bounded
+project sweep omits rows, startup reports the omission in its untrusted
+context diagnostics.
 
 The installer is opt-in and never grants blanket hook trust:
 
