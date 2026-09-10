@@ -52,7 +52,10 @@ global preferences, corrections, and identities plus null or malformed
 timestamps for safe classification), and backs off failed review sweeps from
 one minute up to one hour instead of retrying every session. If a bounded
 project sweep omits rows, startup reports the omission in its untrusted
-context diagnostics.
+context diagnostics. If SQLite cannot execute the JSON prefilter, startup uses
+a capped compatibility query and reports that degraded path visibly; callback
+recall is selected against the concrete project path rather than synthetic
+startup wording.
 
 The installer is opt-in and never grants blanket hook trust:
 
