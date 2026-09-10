@@ -16,5 +16,7 @@ adapter/dist/
 reports/
 migration-reports/
 .local/
+.adapter-journal/
+.adapter-review/
 PLAN.json
 REPORT.json

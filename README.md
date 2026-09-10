@@ -16,6 +16,8 @@ the setup or build commands.
 bun run setup
 bun run build
 bun test
+bun run hook-smoke                 # dry run
+bun run hook-smoke -- --run        # clean fixture only
 ```
 
 `setup` verifies the OMP commit and creates local `node_modules/@oh-my-pi/*`
@@ -23,6 +25,39 @@ links to `pi-ai`, `pi-catalog`, `pi-natives`, and `pi-utils`. `build` emits the
 ignored `adapter/dist/shared-memory.js`; `test` rebuilds it, runs the adapter
 regression suite, and runs the migration suite. No network fetch or live-store
 write is part of these commands.
+
+## Host hooks
+
+The adapter emits a SessionStart payload for Claude or Codex. It reads hook JSON
+from stdin, uses its `cwd` (or an explicit absolute `--cwd`), and writes only the
+JSON hook response to stdout:
+
+```sh
+adapter/dist/shared-memory.js session-start --cwd /absolute/project
+printf '%s\n' '{"cwd":"/absolute/project","source":"startup"}' \
+  | adapter/dist/shared-memory.js startup --host codex
+adapter/dist/shared-memory.js review --cwd /absolute/project --due-days 7
+```
+
+`startup` is an alias for `session-start` for installed host commands. Recall
+content is marked as untrusted data and is never a host instruction. Startup
+reports missing or unreadable stores instead of silently opening a replacement
+database. It bounds injected context and reports omitted or stale notes. A due
+review is read-only and does not prune or repair memories; it only writes a private
+snapshot after a successful explicit review.
+
+The installer is opt-in and never grants blanket hook trust:
+
+```sh
+bun run install-hooks -- --command /absolute/path/shared-memory
+bun run install-hooks -- --command /absolute/path/shared-memory --apply
+```
+
+Review the dry run first. `--apply` preserves existing hook groups, appends one
+command to each selected host, and leaves a private backup beside any existing
+settings file. Then use the host's normal hook review flow and trust only the exact
+command. Do not use a permanent bypass. Hook timeouts are seconds (Claude 10,
+Codex 15); startup has a shorter internal bound.
 
 ## Runtime
 
@@ -71,11 +106,12 @@ The migration writes through the vendored `BeamMemory.importFromDict` source;
 it does not depend on a transient generated `engine.js` bundle. The generated
 adapter bundle is a reproducible build artifact and is intentionally ignored.
 
-## Known limits
+## Reliability limits
 
 The adapter exposes explicit memory tools; it does not automatically inject a
-recall into every host prompt. Retrieval scores are implementation signals, not
-calibrated confidence values, and there is no general abstention threshold for
-irrelevant matches. SQLite rows are mutable rather than an append-only audit
-log, and there is no automatic retention sweep or maintenance scheduler. Plan
-backups, review, and maintenance around the host application's operating model.
+recall into every host prompt. Raw MCP recall preserves stock candidates and order,
+but labels evidence and warns that scores are not confidence. SessionStart may
+abstain when results have no query-specific evidence. The private adapter journal
+covers adapter mutations only; native OMP and other writers are not journaled.
+Weekly review is non-destructive and does not automatically delete, invalidate, or
+rewrite rows.

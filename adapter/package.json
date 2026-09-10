@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "build": "bun build src/entry.ts --target bun --outfile dist/shared-memory.js --external fastembed --external onnxruntime-node --minify",
-    "test": "bun test test/adapter.test.ts"
+    "test": "bun test ./test/*.test.ts"
   }
 }

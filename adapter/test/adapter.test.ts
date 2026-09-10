@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
+import { initBeam } from "../src/vendor/mnemopi/core/beam/schema";
 
 const adapterRoot = path.resolve(import.meta.dir, "..");
-const bundlePath = path.join(adapterRoot, "dist", "shared-memory.js");
+const bundlePath = process.env.ADAPTER_BUNDLE?.trim() || path.join(adapterRoot, "dist", "shared-memory.js");
 
 interface Fixture {
 	root: string;
@@ -21,6 +22,11 @@ function fixture(): Fixture {
 	const dbPath = path.join(dataDir, "mnemopi.db");
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(dataDir, { recursive: true });
+	// The reliability contract refuses a missing canonical store. Seed an empty
+	// canonical schema in the fixture; tests still exercise the adapter's first
+	// write without ever touching the live OMP database.
+	const db = new Database(dbPath);
+	try { initBeam(db); } finally { db.close(); }
 	writeFileSync(
 		path.join(agentDir, "config.yml"),
 		["memory:", "  backend: mnemopi", "mnemopi:", `  dbPath: ${dbPath}`, "  scoping: global", "  noEmbeddings: true", "  embeddingModel: BAAI/bge-base-en-v1.5", ""].join("\n"),
@@ -52,6 +58,15 @@ async function run(fx: Fixture, args: readonly string[], input?: string): Promis
 		proc.exited,
 	]);
 	return { stdout, stderr, exitCode };
+}
+
+async function runRememberWithLockRetry(fx: Fixture, content: string): Promise<RunResult> {
+	for (let attempt = 0; attempt < 8; attempt += 1) {
+		const result = await run(fx, ["call", "mnemopi_remember", JSON.stringify({ content, bank: "default" }), "--cwd", fx.root]);
+		if (result.exitCode === 0 || !result.stdout.includes("store_unavailable")) return result;
+		await Bun.sleep(50);
+	}
+	return run(fx, ["call", "mnemopi_remember", JSON.stringify({ content, bank: "default" }), "--cwd", fx.root]);
 }
 
 function json(result: RunResult): Record<string, unknown> {
@@ -126,7 +141,7 @@ describe("shared-memory adapter bundle", () => {
 			expect(seed.exitCode).toBe(0);
 			const results = await Promise.all(
 				["concurrent writer one", "concurrent writer two"].map(content =>
-					run(fx, ["call", "mnemopi_remember", JSON.stringify({ content, bank: "default" }), "--cwd", fx.root]),
+					runRememberWithLockRetry(fx, content),
 				),
 			);
 			if (results.some(result => result.exitCode !== 0)) throw new Error(JSON.stringify(results));

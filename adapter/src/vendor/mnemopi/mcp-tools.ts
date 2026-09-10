@@ -1,9 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DEFAULT_DB_FILENAME, dataDir } from "./config";
-import { BankManager } from "./core/banks";
 import { BeamMemory, type RecallOptions } from "./core/beam";
 import { addTriple, queryTriples } from "./core/triples";
+import {
+	annotateRecallResults,
+	prepareMutationStore,
+	prepareRecallStore,
+	ReliabilityError,
+	resolveStore,
+	type RecallCandidate,
+} from "../../reliability/policy";
+import { createMutationJournal, type JournalMutation } from "../../reliability/journal";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -432,10 +440,7 @@ function resolveBank(args: ToolArguments): string {
 }
 
 function bankDbPath(bank: string): string {
-	const baseBank = process.env.MNEMOPI_BASE_BANK || "default";
-	const baseDbPath = process.env.MNEMOPI_BASE_DB_PATH;
-	if (baseDbPath && bank === baseBank) return baseDbPath;
-	return new BankManager(dataDir()).getBankDbPath(bank);
+	return resolveStore(bank).dbPath;
 }
 
 function createBeam(args: ToolArguments, bank = resolveBank(args)): BeamMemory {
@@ -461,6 +466,17 @@ function sharedBeam(): BeamMemory {
 
 async function withBeam<T>(args: ToolArguments, fn: (beam: BeamMemory, bank: string) => T | Promise<T>): Promise<T> {
 	const bank = resolveBank(args);
+	const prepared = prepareRecallStore(bank);
+	if (prepared.kind === "error") throw prepared.error;
+	if (prepared.kind === "empty_derived") {
+		throw new ReliabilityError("store_missing", `Resolved derived Mnemopi bank is missing: ${prepared.store.dbPath}`, {
+			dbPath: prepared.store.dbPath,
+			bank,
+			baseBank: prepared.store.baseBank,
+			baseDbPath: prepared.store.baseDbPath,
+			configFiles: prepared.store.configFiles,
+		});
+	}
 	const beam = createBeam(args, bank);
 	try {
 		const result = await fn(beam, bank);
@@ -473,6 +489,141 @@ async function withBeam<T>(args: ToolArguments, fn: (beam: BeamMemory, bank: str
 	} finally {
 		beam.close();
 	}
+}
+
+interface MutationExecution {
+	readonly committed: boolean;
+	readonly result: ToolResult;
+	readonly mutation?: JournalMutation;
+}
+
+/** Run one adapter mutation with a durable attempt before Beam opens/writes. */
+async function withJournaledMutation(
+	args: ToolArguments,
+	mutation: JournalMutation,
+	fn: (beam: BeamMemory, bank: string, attemptMutation: JournalMutation) => MutationExecution,
+	readBeforeAttempt?: (beam: BeamMemory, bank: string) => JournalMutation,
+): Promise<ToolResult> {
+	const bank = mutation.bank;
+	const prepared = prepareMutationStore(bank);
+	if (prepared.kind === "error") return prepared.error.toResult();
+	const journal = createMutationJournal(prepared.store.dataDir);
+	let attemptMutation = mutation;
+	let beam: BeamMemory | undefined;
+	let transactionOpen = false;
+	if (readBeforeAttempt !== undefined) {
+		try {
+			beam = createBeam(args, bank);
+			beam.db.exec("BEGIN IMMEDIATE");
+			transactionOpen = true;
+			attemptMutation = readBeforeAttempt(beam, bank);
+		} catch (error) {
+			try { if (transactionOpen) beam?.db.exec("ROLLBACK"); } catch { /* best effort */ }
+			try { await beam?.flushExtractions(); } finally { beam?.close(); }
+			return { status: "error", error: "mutation_prepare_failed", message: error instanceof Error ? error.message : String(error), bank };
+		}
+	}
+	let operationId: string;
+	try {
+		operationId = journal.appendAttempt(attemptMutation);
+	} catch (error) {
+		try { if (transactionOpen) beam?.db.exec("ROLLBACK"); } catch { /* best effort */ }
+		try { await beam?.flushExtractions(); } finally { beam?.close(); }
+		return {
+			status: "error",
+			error: "journal_unavailable",
+			message: error instanceof Error ? error.message : String(error),
+			journal_path: journal.path,
+			bank,
+		};
+	}
+	if (prepared.created) {
+		try {
+			mkdirSync(dirname(prepared.store.dbPath), { recursive: true, mode: 0o700 });
+		} catch (error) {
+			try { journal.appendOutcome(attemptMutation, operationId, "failed", error); } catch { /* preserve mutation failure */ }
+			try { if (transactionOpen) beam?.db.exec("ROLLBACK"); } catch { /* best effort */ }
+			try { await beam?.flushExtractions(); } finally { beam?.close(); }
+			return { status: "error", error: "mutation_failed", message: error instanceof Error ? error.message : String(error), operation_id: operationId, bank };
+		}
+	}
+	if (beam === undefined) {
+		try { beam = createBeam(args, bank); }
+		catch (error) {
+			try { journal.appendOutcome(attemptMutation, operationId, "failed", error); } catch { /* preserve mutation failure */ }
+			return { status: "error", error: "mutation_failed", message: error instanceof Error ? error.message : String(error), operation_id: operationId, bank };
+		}
+	}
+	let execution: MutationExecution;
+	try {
+		execution = fn(beam, bank, attemptMutation);
+	} catch (error) {
+		try { journal.appendOutcome(attemptMutation, operationId, "failed", error); } catch { /* preserve mutation failure */ }
+		try { if (transactionOpen) beam.db.exec("ROLLBACK"); } catch { /* best effort */ }
+		try { beam.close(); } catch { /* best effort */ }
+		return { status: "error", error: "mutation_failed", message: error instanceof Error ? error.message : String(error), operation_id: operationId, bank };
+	}
+	try {
+		if (transactionOpen) {
+			if (execution.committed) beam.db.exec("COMMIT");
+			else beam.db.exec("ROLLBACK");
+		}
+	} catch (error) {
+		try { journal.appendOutcome(attemptMutation, operationId, "failed", error); } catch { /* preserve mutation failure */ }
+		try { beam.close(); } catch { /* best effort */ }
+		return { status: "error", error: "mutation_failed", message: error instanceof Error ? error.message : String(error), operation_id: operationId, bank };
+	}
+	const finalMutation = execution.mutation ?? attemptMutation;
+	let postCommitError: unknown | undefined;
+	try {
+		await beam.flushExtractions();
+	} catch (error) {
+		postCommitError = error;
+	} finally {
+		try { beam.close(); } catch (error) { postCommitError ??= error; }
+	}
+	if (postCommitError !== undefined) {
+		try {
+			journal.appendOutcome(finalMutation, operationId, execution.committed ? "committed" : "failed", postCommitError);
+		} catch (outcomeError) {
+			postCommitError = new Error(
+				`${postCommitError instanceof Error ? postCommitError.message : String(postCommitError)}; ` +
+				`outcome append failed: ${outcomeError instanceof Error ? outcomeError.message : String(outcomeError)}`,
+			);
+		}
+		if (execution.committed) {
+			return {
+				status: "mutation_committed_journal_incomplete",
+				error: "mutation_committed_journal_incomplete",
+				message: postCommitError instanceof Error ? postCommitError.message : String(postCommitError),
+				operation_id: operationId,
+				memory_id: finalMutation.memoryId ?? null,
+				bank,
+			};
+		}
+		return {
+			status: "error",
+			error: "mutation_failed",
+			message: postCommitError instanceof Error ? postCommitError.message : String(postCommitError),
+			operation_id: operationId,
+			bank,
+		};
+	}
+	try {
+		journal.appendOutcome(finalMutation, operationId, execution.committed ? "committed" : "failed");
+	} catch (error) {
+		if (execution.committed) {
+			return {
+				status: "mutation_committed_journal_incomplete",
+				error: "mutation_committed_journal_incomplete",
+				message: error instanceof Error ? error.message : String(error),
+				operation_id: operationId,
+				memory_id: finalMutation.memoryId ?? null,
+				bank,
+			};
+		}
+	}
+	return { ...execution.result, operation_id: operationId, bank };
 }
 function serialize(value: unknown): unknown {
 	if (value instanceof Date) return value.toISOString();
@@ -521,10 +672,20 @@ function required(args: ToolArguments, key: string): string | ToolResult {
 async function handleRemember(args: ToolArguments): Promise<ToolResult> {
 	const content = required(args, "content");
 	if (typeof content !== "string") return content;
-	return withBeam(args, (beam, bank) => {
+	const bank = resolveBank(args);
+	const importance = numberArg(args, "importance", 0.5);
+	const mutation: JournalMutation = {
+		operation: "remember",
+		bank,
+		sourceHarness: stringArg(args, "source", "mcp"),
+		content,
+		afterContent: content,
+		importance,
+	};
+	return withJournaledMutation(args, mutation, beam => {
 		const memoryId = beam.remember(content, {
 			source: stringArg(args, "source", "mcp"),
-			importance: numberArg(args, "importance", 0.5),
+			importance,
 			metadata: metadataArg(args),
 			extractEntities: booleanArg(args, "extract_entities"),
 			extract: booleanArg(args, "extract"),
@@ -532,13 +693,21 @@ async function handleRemember(args: ToolArguments): Promise<ToolResult> {
 			scope: stringArg(args, "scope", "bank"),
 			trustTier: "IMPORTED",
 		});
-		return { status: "stored", memory_id: memoryId, bank, content, content_preview: content.slice(0, 100) };
+		return {
+			committed: true,
+			mutation: { ...mutation, memoryId },
+			result: { status: "stored", memory_id: memoryId, content, content_preview: content.slice(0, 100) },
+		};
 	});
 }
 
 async function handleRecall(args: ToolArguments): Promise<ToolResult> {
 	const query = required(args, "query");
 	if (typeof query !== "string") return query;
+	const bank = resolveBank(args);
+	const prepared = prepareRecallStore(bank);
+	if (prepared.kind === "error") return prepared.error.toResult();
+	if (prepared.kind === "empty_derived") return { status: "ok", query, count: 0, results: [], bank, derived_bank_absent: true };
 	return withBeam(args, async (beam, bank) => {
 		const topK = Math.trunc(numberArg(args, "top_k", numberArg(args, "limit", 5)));
 		const options: RecallOptions & Record<string, unknown> = {
@@ -553,7 +722,8 @@ async function handleRecall(args: ToolArguments): Promise<ToolResult> {
 			if (key in args) options[key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())] = args[key];
 		}
 		const results = (await beam.recall(query, topK, options)).map(row => ({ ...row, bank }));
-		return { status: "ok", query, count: results.length, results: serialize(results), bank };
+		const annotated = annotateRecallResults(query, results as RecallCandidate[]);
+		return { status: annotated.status, query, count: results.length, results: serialize(annotated.results), bank, score_is_not_confidence: true };
 	});
 }
 
@@ -622,11 +792,21 @@ async function handleScratchpadClear(args: ToolArguments): Promise<ToolResult> {
 async function handleInvalidate(args: ToolArguments): Promise<ToolResult> {
 	const memoryId = required(args, "memory_id");
 	if (typeof memoryId !== "string") return memoryId;
-	return withBeam(args, (beam, bank) => {
-		const invalidated = beam.invalidate(memoryId, optionalStringArg(args, "replacement_id"));
-		return invalidated
-			? { status: "invalidated", memory_id: memoryId, bank }
-			: { status: "not_found", error: "memory_not_found", memory_id: memoryId, bank };
+	const bank = resolveBank(args);
+	const replacementId = optionalStringArg(args, "replacement_id");
+	const mutation: JournalMutation = { operation: "invalidate", bank, memoryId, replacementId, sourceHarness: "mcp" };
+	return withJournaledMutation(args, mutation, (beam, _bank, attemptMutation) => {
+		const invalidated = beam.invalidate(memoryId, replacementId);
+		return {
+			committed: invalidated,
+			mutation: attemptMutation,
+			result: invalidated
+				? { status: "invalidated", memory_id: memoryId }
+				: { status: "not_found", error: "memory_not_found", memory_id: memoryId },
+		};
+	}, beam => {
+		const existing = beam.get(memoryId) as { content?: string | null } | null;
+		return { ...mutation, beforeContent: existing?.content ?? null, afterContent: existing?.content ?? null };
 	});
 }
 
@@ -644,19 +824,23 @@ async function handleGet(args: ToolArguments): Promise<ToolResult> {
 async function handleUpdate(args: ToolArguments): Promise<ToolResult> {
 	const memoryId = required(args, "memory_id");
 	if (typeof memoryId !== "string") return memoryId;
-	return withBeam(args, (beam, bank) => {
-		if (!("content" in args) && !("importance" in args)) return { error: "content or importance is required" };
-		const content = "content" in args ? stringArg(args, "content") : null;
-		if (content !== null && content.trim().length === 0) return { error: "content is required" };
-		const importance = "importance" in args ? numberArg(args, "importance", Number.NaN) : null;
-		const ok = beam.updateWorking(
-			memoryId,
-			content,
-			importance !== null && Number.isFinite(importance) ? importance : null,
-		);
-		return ok
-			? { status: "updated", memory_id: memoryId, bank }
-			: { status: "not_found", error: "memory_not_found", memory_id: memoryId, bank };
+	if (!("content" in args) && !("importance" in args)) return { error: "content or importance is required" };
+	const content = "content" in args ? stringArg(args, "content") : null;
+	if (content !== null && content.trim().length === 0) return { error: "content is required" };
+	const importance = "importance" in args ? numberArg(args, "importance", Number.NaN) : null;
+	const bank = resolveBank(args);
+	const mutation: JournalMutation = { operation: "update", bank, memoryId, sourceHarness: "mcp", afterContent: content, importance };
+	return withJournaledMutation(args, mutation, (beam, _bank, attemptMutation) => {
+		const ok = beam.updateWorking(memoryId, content, importance !== null && Number.isFinite(importance) ? importance : null);
+		return {
+			committed: ok,
+			mutation: attemptMutation,
+			result: ok ? { status: "updated", memory_id: memoryId } : { status: "not_found", error: "memory_not_found", memory_id: memoryId },
+		};
+	}, beam => {
+		const existing = beam.get(memoryId) as { content?: string | null } | null;
+		const before = existing?.content ?? null;
+		return { ...mutation, beforeContent: before, afterContent: content ?? before };
 	});
 }
 
@@ -993,7 +1177,12 @@ export async function handleToolCall(name: string, args: ToolArguments = {}): Pr
 	}
 	const handler = TOOL_HANDLERS[name];
 	if (handler === undefined) throw new Error(`Unknown tool: ${name}`);
-	return handler(args);
+	try {
+		return await handler(args);
+	} catch (error) {
+		if (error instanceof ReliabilityError) return error.toResult();
+		throw error;
+	}
 }
 export function getToolDefinitions(): readonly ToolDefinition[] {
 	return TOOLS.filter(tool => ADAPTER_TOOL_NAMES.has(tool.name));

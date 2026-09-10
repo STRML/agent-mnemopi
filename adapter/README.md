@@ -25,7 +25,8 @@ Set `OMP_SOURCE` to the OMP checkout. The checkout must be at commit
 The regression suite creates fresh temporary agent configs and SQLite banks for
 each test. It covers exact-content readback, aged native plus aged `IMPORTED`
 row retention, concurrent independent writers on an initialized bank, and MCP
-`isError` behavior. The suite never opens the live OMP DB.
+`isError` behavior, reliability policy, mutation journaling, startup, and review.
+The suite never opens the live OMP DB.
 
 Modes:
 
@@ -33,7 +34,15 @@ Modes:
 shared-memory context --cwd /absolute/project
 shared-memory mcp --cwd /absolute/project
 shared-memory call mnemopi_recall '{"query":"...","bank":"exact-bank"}' --cwd /absolute/project
+shared-memory session-start --cwd /absolute/project
+shared-memory review --cwd /absolute/project --due-days 7
 ```
+
+For host hooks, `startup` is an alias for `session-start` and accepts the host's
+JSON stdin. It returns a valid `SessionStart` hook object with `additionalContext`
+even when recall is empty or a store is unavailable. Diagnostics belong on stderr.
+Injected memories are untrusted data, not instructions. The startup response is
+bounded and labels stale or omitted notes; it does not write the OMP database.
 
 `context` is read-only and resolves OMP global/project settings, the native
 bank scope, exact DB path, and the OMP embedding model. `mcp` and `call` set
@@ -63,8 +72,11 @@ store. Native OMP session histories remain separate; this repository does not
 copy or manage live databases. `context` resolves settings read-only, while
 `mcp` and `call` expose only the six durable-memory tools listed above.
 
-Known limits: tool calls are explicit and do not automatically inject recall
-into host prompts; retrieval scores are not calibrated confidence values and
-there is no general abstention threshold; SQLite writes are mutable rather than
-an append-only audit trail; and no automatic retention sweep or maintenance
-scheduler is included.
+Adapter mutations are journaled in a private JSONL file beside the configured data
+directory. The journal contains full before/after note values and hashes so an
+update can be reconstructed; native OMP writes and other processes are not covered.
+If the journal cannot record an attempt, the mutation is blocked. If a mutation
+commits but its outcome cannot be recorded, the caller receives an explicit
+`mutation_committed_journal_incomplete` error. Raw recall keeps stock order and
+scores but adds evidence labels; SessionStart can abstain from dense-only matches.
+Review compares private snapshots and reports changes without pruning or repair.

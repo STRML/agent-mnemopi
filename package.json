@@ -5,6 +5,8 @@
   "scripts": {
     "setup": "bun scripts/setup-omp-deps.ts",
     "build": "bun run setup && bun run --cwd adapter build",
-    "test": "bun run build && bun run --cwd adapter test && bun test migration/claude-memory.test.ts"
+    "test": "bun run build && bun run --cwd adapter test && bun test migration/claude-memory.test.ts",
+    "install-hooks": "bun scripts/install-hooks.ts",
+    "hook-smoke": "bun scripts/hook-smoke.ts"
   }
 }
