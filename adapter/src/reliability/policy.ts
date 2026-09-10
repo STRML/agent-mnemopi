@@ -135,13 +135,11 @@ export function prepareMutationStore(bank: string): MutationStore {
 
 export type RecallCandidate = Record<string, unknown> & { readonly id: string };
 export type RecallEvidence = "metadata_exact" | "query_lexical" | "dense_only" | "no_query_evidence";
-// Recall callbacks may prepend natural-language framing (for example,
-// "session startup") to a concrete project path. These words should not be
-// allowed to turn a positive lexical score into evidence by themselves.
+// Keep content-bearing words available to natural-language queries. Boundary
+// matching prevents short words from matching inside larger words.
 const LEXICAL_STOPWORDS = new Set([
 	"a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in", "is", "it", "its",
 	"of", "on", "or", "that", "the", "their", "there", "this", "to", "was", "were", "with", "you", "your",
-	"exists", "list", "session", "startup",
 ]);
 
 function metadataValue(result: RecallCandidate, key: "task_key" | "cwd"): string | undefined {

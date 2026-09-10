@@ -194,15 +194,17 @@ describe("SessionStart bounded metadata recall", () => {
 				recall: () => [
 					{ id: "unrelated", content: "session startup checklist", keyword_score: 0.4 },
 					{ id: "path-match", content: `handoff for ${fx.root}`, keyword_score: 0.4 },
+					{ id: "metadata-match", content: "metadata-scoped callback", metadata: { cwd: fx.root } },
 				],
 				selectInjectableRecall: (query, results) => {
 					callbackQuery = query;
 					return selectInjectableRecall(query, results as RecallCandidate[]);
 				},
 			});
-			expect(callbackQuery).toBe(`session startup ${fx.root}`);
+			expect(callbackQuery).toBe(fx.root);
 			const context = output.hookSpecificOutput.additionalContext;
 			expect(context).toContain("path-match");
+			expect(context).toContain("metadata-scoped callback");
 			expect(context).not.toContain("unrelated");
 		} finally { close(fx); }
 	});

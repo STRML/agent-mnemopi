@@ -66,7 +66,8 @@ describe("reliability policy", () => {
 
 	it("ignores stopwords and requires token boundaries for lexical evidence", () => {
 		const stopwordSubstring = { id: "stopword-substring", content: "listing existing context", keyword_score: 0.4 };
-		const startupBoilerplate = { id: "startup-boilerplate", content: "session startup checklist", keyword_score: 0.4 };
+		const configFile = { id: "config-file", content: "does the config file exist", keyword_score: 0.4 };
+		const bankList = { id: "bank-list", content: "list the banks", keyword_score: 0.4 };
 		const pathPrefix = { id: "path-prefix", content: "handoff for /workspace/project-old", keyword_score: 0.4 };
 		const pathMatch = { id: "path-match", content: "handoff for /workspace/project", keyword_score: 0.4 };
 
@@ -75,7 +76,20 @@ describe("reliability policy", () => {
 			reason: "no_query_specific_evidence",
 			results: [],
 		});
-		expect(selectInjectableRecall("session startup /workspace/project", [startupBoilerplate, pathPrefix, pathMatch])).toMatchObject({
+		expect(selectInjectableRecall("does the config file exist", [configFile])).toMatchObject({
+			status: "selected",
+			results: [{ id: "config-file", evidence: "query_lexical", evidence_label: "query_lexical" }],
+		});
+		expect(selectInjectableRecall("list the banks", [bankList])).toMatchObject({
+			status: "selected",
+			results: [{ id: "bank-list", evidence: "query_lexical", evidence_label: "query_lexical" }],
+		});
+		expect(selectInjectableRecall("list the banks", [stopwordSubstring])).toEqual({
+			status: "abstained",
+			reason: "no_query_specific_evidence",
+			results: [],
+		});
+		expect(selectInjectableRecall("session startup /workspace/project", [pathPrefix, pathMatch])).toMatchObject({
 			status: "selected",
 			results: [{ id: "path-match", evidence: "query_lexical", evidence_label: "query_lexical" }],
 		});

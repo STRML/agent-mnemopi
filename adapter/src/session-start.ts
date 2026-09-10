@@ -111,6 +111,7 @@ function mainCheckout(cwd: string): string {
 }
 
 function parseMetadata(value: unknown): Record<string, unknown> {
+	if (value !== null && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
 	if (typeof value !== "string" || value.trim().length === 0) return {};
 	try {
 		const parsed: unknown = JSON.parse(value);
@@ -544,7 +545,7 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 				// metadata-qualified and deterministic.
 				const selector = options.selectInjectableRecall ?? policySelectInjectableRecall;
 				if (selector) {
-					const selected = selector(`session startup ${projectRoot}`, recalled as unknown as RecallCandidate[]);
+					const selected = selector(projectRoot, recalled as unknown as RecallCandidate[]);
 					allRows.push(...callbackRows(selected, bank, now));
 				}
 			} catch (error) {
