@@ -43,6 +43,10 @@ JSON stdin. It returns a valid `SessionStart` hook object with `additionalContex
 even when recall is empty or a store is unavailable. Diagnostics belong on stderr.
 Injected memories are untrusted data, not instructions. The startup response is
 bounded and labels stale or omitted notes; it does not write the OMP database.
+Each startup checks the weekly review schedule and, when due, runs a bounded
+read-only review automatically. A private full-text snapshot is published only
+after successful completion; the explicit `review` command remains available.
+Review does not prune or repair memories.
 
 `context` is read-only and resolves OMP global/project settings, the native
 bank scope, exact DB path, and the OMP embedding model. `mcp` and `call` set
@@ -73,10 +77,12 @@ copy or manage live databases. `context` resolves settings read-only, while
 `mcp` and `call` expose only the six durable-memory tools listed above.
 
 Adapter mutations are journaled in a private JSONL file beside the configured data
-directory. The journal contains full before/after note values and hashes so an
-update can be reconstructed; native OMP writes and other processes are not covered.
+directory. The journal contains full before/after note text and hashes so an update
+can be reconstructed; native OMP writes and other processes are not covered.
 If the journal cannot record an attempt, the mutation is blocked. If a mutation
 commits but its outcome cannot be recorded, the caller receives an explicit
 `mutation_committed_journal_incomplete` error. Raw recall keeps stock order and
-scores but adds evidence labels; SessionStart can abstain from dense-only matches.
-Review compares private snapshots and reports changes without pruning or repair.
+scores but adds evidence labels. Task-scoped recall selection can abstain from
+dense-only matches; SessionStart's curated bootstrap is deterministic and does
+not apply that query-abstention policy. Review compares private snapshots and
+reports changes without pruning or repair.

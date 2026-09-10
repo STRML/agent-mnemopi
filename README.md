@@ -15,7 +15,7 @@ the setup or build commands.
 ```sh
 bun run setup
 bun run build
-bun test
+bun run test
 bun run hook-smoke                 # dry run
 bun run hook-smoke -- --run        # clean fixture only
 ```
@@ -43,8 +43,10 @@ adapter/dist/shared-memory.js review --cwd /absolute/project --due-days 7
 content is marked as untrusted data and is never a host instruction. Startup
 reports missing or unreadable stores instead of silently opening a replacement
 database. It bounds injected context and reports omitted or stale notes. A due
-review is read-only and does not prune or repair memories; it only writes a private
-snapshot after a successful explicit review.
+review runs automatically at startup on its weekly schedule by default. It is
+read-only, does not prune or repair memories, and publishes a private full-text
+snapshot only after successful completion; the explicit `review` command is also
+available.
 
 The installer is opt-in and never grants blanket hook trust:
 
@@ -110,8 +112,9 @@ adapter bundle is a reproducible build artifact and is intentionally ignored.
 
 The adapter exposes explicit memory tools; it does not automatically inject a
 recall into every host prompt. Raw MCP recall preserves stock candidates and order,
-but labels evidence and warns that scores are not confidence. SessionStart may
-abstain when results have no query-specific evidence. The private adapter journal
-covers adapter mutations only; native OMP and other writers are not journaled.
-Weekly review is non-destructive and does not automatically delete, invalidate, or
-rewrite rows.
+but labels evidence and warns that scores are not confidence. Task-scoped recall
+selection may abstain when results have no query-specific evidence; SessionStart's
+curated bootstrap is deterministic and does not apply that query-abstention policy.
+The private adapter journal covers adapter mutations only; native OMP and other
+writers are not journaled. Weekly review is non-destructive and does not
+automatically delete, invalidate, or rewrite rows.
