@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_DB_FILENAME, dataDir } from "../vendor/mnemopi/config";
+import { resolveBankDbPath } from "./bank-path";
 
 export type ReliabilityErrorCode = "store_missing" | "store_unavailable" | "store_schema_mismatch" | "journal_unavailable";
 
@@ -93,7 +94,7 @@ export function resolveStore(bank: string): StoreResolution {
 	const configuredDataDir = dataDir();
 	const baseBank = process.env.MNEMOPI_BASE_BANK ?? "default";
 	const baseDbPath = configuredBaseDbPath();
-	const dbPath = bank === baseBank ? baseDbPath : join(configuredDataDir, "banks", bank, DEFAULT_DB_FILENAME);
+	const dbPath = resolveBankDbPath({ dataDir: configuredDataDir, baseBank, baseDbPath }, bank);
 	return { dbPath, dataDir: configuredDataDir, bank, baseBank, baseDbPath, configFiles: configuredFiles() };
 }
 export function preflightResolvedStore(store: StoreResolution): PreflightResult { return preflightStore(store); }

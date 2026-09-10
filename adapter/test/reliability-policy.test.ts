@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMutationJournal, journalPath, MutationJournal, setJournalSyncHook, setMutationJournalFactory } from "../src/reliability/journal";
-import { annotateRecallResults, prepareMutationStore, prepareRecallStore, preflightStore, selectInjectableRecall } from "../src/reliability/policy";
+import { annotateRecallResults, prepareMutationStore, prepareRecallStore, preflightStore, resolveStore, selectInjectableRecall } from "../src/reliability/policy";
 import { BeamMemory } from "../src/vendor/mnemopi/core/beam/index";
 import { handleToolCall } from "../src/vendor/mnemopi/mcp-tools";
 
@@ -104,6 +104,26 @@ describe("reliability policy", () => {
 			expect(prepareMutationStore("project-x").kind).toBe("ready");
 		} finally {
 			if (oldDir === undefined) delete process.env.MNEMOPI_DATA_DIR; else process.env.MNEMOPI_DATA_DIR = oldDir;
+			if (oldBase === undefined) delete process.env.MNEMOPI_BASE_DB_PATH; else process.env.MNEMOPI_BASE_DB_PATH = oldBase;
+			if (oldBank === undefined) delete process.env.MNEMOPI_BASE_BANK; else process.env.MNEMOPI_BASE_BANK = oldBank;
+		}
+	});
+
+	it("resolves literal default beside a custom base bank", () => {
+		const root = mkdtempSync(join(tmpdir(), "mnemopi-policy-paths-"));
+		const customBase = join(root, "custom-base", "mnemopi.db");
+		const oldData = process.env.MNEMOPI_DATA_DIR;
+		const oldBase = process.env.MNEMOPI_BASE_DB_PATH;
+		const oldBank = process.env.MNEMOPI_BASE_BANK;
+		try {
+			process.env.MNEMOPI_DATA_DIR = root;
+			process.env.MNEMOPI_BASE_DB_PATH = customBase;
+			process.env.MNEMOPI_BASE_BANK = "custom";
+			expect(resolveStore("custom").dbPath).toBe(customBase);
+			expect(resolveStore("default").dbPath).toBe(join(root, "mnemopi.db"));
+			expect(resolveStore("project").dbPath).toBe(join(root, "banks", "project", "mnemopi.db"));
+		} finally {
+			if (oldData === undefined) delete process.env.MNEMOPI_DATA_DIR; else process.env.MNEMOPI_DATA_DIR = oldData;
 			if (oldBase === undefined) delete process.env.MNEMOPI_BASE_DB_PATH; else process.env.MNEMOPI_BASE_DB_PATH = oldBase;
 			if (oldBank === undefined) delete process.env.MNEMOPI_BASE_BANK; else process.env.MNEMOPI_BASE_BANK = oldBank;
 		}

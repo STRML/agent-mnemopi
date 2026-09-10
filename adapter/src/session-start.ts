@@ -3,6 +3,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, open
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { contextForCwd, type AdapterContext } from "./context";
+import { resolveBankDbPath } from "./reliability/bank-path";
 import { selectInjectableRecall as policySelectInjectableRecall, type RecallCandidate } from "./reliability/policy";
 import { reviewDue, type ReviewResult } from "./review";
 
@@ -12,6 +13,14 @@ const REVIEW_FAILURE_FILE = "review-failure.json";
 const REVIEW_RETRY_BASE_MS = 60_000;
 const REVIEW_RETRY_MAX_MS = 3_600_000;
 const STALE_DAYS = 30;
+// Startup context is a bounded bootstrap, not a historical export. Keep one
+// year of valid timestamped evidence while retaining NULL/malformed timestamps
+// for the existing JS parser to classify (or reject) conservatively.
+const STARTUP_LOOKBACK_DAYS = 365;
+// A fallback protects startup if a legacy SQLite build cannot evaluate the
+// JSON predicate. The normal path is filtered in SQLite and has no row cap;
+// this cap only applies when falling back to the compatibility query.
+const SQL_FALLBACK_ROW_LIMIT = 4096;
 const CURATED_KINDS = new Set(["preference", "preferences", "correction", "identity"]);
 const PROJECT_KINDS = new Set(["handoff", "project_handoff", "note", "project_note", "relevant"]);
 
@@ -84,9 +93,7 @@ function nowValue(value: SessionStartOptions["now"]): Date {
 }
 
 function dbPathForBank(context: AdapterContext, bank: string): string {
-	if (bank === context.baseBank) return context.dbPath;
-	if (bank === "default") return path.join(context.dataDir, "mnemopi.db");
-	return path.join(context.dataDir, "banks", bank, "mnemopi.db");
+	return resolveBankDbPath({ dataDir: context.dataDir, baseBank: context.baseBank, baseDbPath: context.dbPath }, bank);
 }
 
 function mainCheckout(cwd: string): string {
@@ -180,6 +187,63 @@ function schemaError(dbPath: string): string | undefined {
 	}
 }
 
+function tableColumns(db: Database, table: string): Set<string> {
+	return new Set(
+		(db.query(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>)
+			.map(row => text(row.name))
+			.filter(Boolean),
+	);
+}
+
+function startupQuery(
+	table: string,
+	columns: Set<string>,
+	bank: string,
+	globalBank: string,
+	projectRoot: string,
+	now: Date,
+): { sql: string; params: unknown[] } {
+	// Use guarded JSON extraction so one malformed metadata blob cannot turn a
+	// whole bank into a startup failure. JS still performs the authoritative
+	// path and type checks after this SQL-side candidate reduction.
+	const metadata = columns.has("metadata_json")
+		? "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END"
+		: "'{}'";
+	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
+	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
+	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
+	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
+	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
+	const globalKind = `${kind} IN ('preference', 'preferences', 'correction', 'identity')`;
+	const projectKind = `${kind} IN ('handoff', 'project_handoff', 'note', 'project_note', 'relevant') OR ${taskKey} <> ''`;
+	const globalScope = bank === globalBank ? "1 = 1" : `${json("$.global")} = 1`;
+	const conditions = [
+		`((${globalScope} AND ${globalKind}) OR (${cwd} = ? AND (${projectKind})))`,
+	];
+	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
+	const params: unknown[] = [projectRoot];
+	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
+	// Future-dated rows are not valid evidence for this startup instant. Null
+	// timestamps retain the historical behavior and are still age=unknown.
+	if (columns.has("timestamp")) {
+		// Keep malformed/legacy timestamp strings for JS's Date.parse handling;
+		// only apply the bounded window to timestamps SQLite can parse.
+		conditions.push("(timestamp IS NULL OR datetime(timestamp) IS NULL OR (datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?)))");
+		params.push(cutoff, now.toISOString());
+	}
+	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
+	return { sql: `SELECT * FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
+}
+
+function fallbackQuery(table: string, columns: Set<string>, now: Date): { sql: string; params: unknown[] } {
+	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
+	const timestamp = columns.has("timestamp") ? " WHERE timestamp IS NULL OR datetime(timestamp) IS NULL OR (datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))" : "";
+	const params: unknown[] = columns.has("timestamp") ? [cutoff, now.toISOString()] : [];
+	params.push(SQL_FALLBACK_ROW_LIMIT);
+	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
+	return { sql: `SELECT * FROM ${table}${timestamp} ORDER BY ${order} LIMIT ?`, params };
+}
+
 function readBank(bank: string, dbPath: string, globalBank: string, projectRoot: string, now: Date, canonical: boolean): BankRead {
 	if (!existsSync(dbPath)) return canonical
 		? { bank, dbPath, rows: [], error: "store_missing" }
@@ -190,10 +254,20 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 		if (mismatch) return { bank, dbPath, rows: [], error: mismatch };
 		const db = new Database(dbPath, { readonly: true });
 		try {
-			const rows = [
-				...db.query("SELECT * FROM working_memory ORDER BY timestamp DESC, id ASC").all(),
-				...db.query("SELECT * FROM episodic_memory ORDER BY timestamp DESC, id ASC").all(),
-			] as RawRow[];
+			const rows: RawRow[] = [];
+			for (const table of ["working_memory", "episodic_memory"] as const) {
+				const columns = tableColumns(db, table);
+				const query = startupQuery(table, columns, bank, globalBank, projectRoot, now);
+				try {
+					rows.push(...db.query(query.sql).all(...query.params) as RawRow[]);
+				} catch {
+					// JSON1 is available in current SQLite, but old stores may be
+					// opened by a runtime without it. Keep startup bounded and let
+					// rowToMemory preserve the existing JS filtering semantics.
+					const fallback = fallbackQuery(table, columns, now);
+					rows.push(...db.query(fallback.sql).all(...fallback.params) as RawRow[]);
+				}
+			}
 			return { bank, dbPath, rows: rows.map(row => rowToMemory(row, bank, globalBank, projectRoot, now)).filter((row): row is StartupMemory => row !== null) };
 		} finally {
 			db.close();
