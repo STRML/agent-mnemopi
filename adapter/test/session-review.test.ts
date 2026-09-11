@@ -290,6 +290,21 @@ describe("SessionStart bounded metadata recall", () => {
 		expect(disagreements).toEqual([]);
 	});
 
+	it("treats only JSON true as global in a non-global bank", async () => {
+		const fx = fixture();
+		try {
+			// A global row reaches every project's startup, so no other truthy value may widen it.
+			add(fx, "flag-true", "preference flagged global with true", { kind: "preference", global: true }, "2026-09-09T00:00:00.000Z");
+			add(fx, "flag-one", "preference flagged global with 1", { kind: "preference", global: 1 }, "2026-09-09T00:00:00.000Z");
+			add(fx, "flag-string", "preference flagged global with a string", { kind: "preference", global: "true" }, "2026-09-09T00:00:00.000Z");
+			const context = { ...fx.context, globalBank: "shared", recallBanks: ["default"] };
+			const output = (await sessionStart(fx.root, { context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(output).toContain("preference flagged global with true");
+			expect(output).not.toContain("preference flagged global with 1");
+			expect(output).not.toContain("preference flagged global with a string");
+		} finally { close(fx); }
+	});
+
 	it("counts project facts outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {

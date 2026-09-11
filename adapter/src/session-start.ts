@@ -262,7 +262,9 @@ function metadataSql(columns: Set<string>, bank: string, globalBank: string): { 
 	const kind = `lower(trim(COALESCE(${field("$.kind")}, ${memoryType}, '')))`;
 	const taskKey = `trim(COALESCE(${field("$.task_key")}, ${field("$.taskKey")}, ''))`;
 	const cwd = `COALESCE(${field("$.cwd")}, '')`;
-	const global = bank === globalBank ? "1" : `(COALESCE(${json("$.global")}, 0) = 1)`;
+	// Only JSON true marks a row global. A global row reaches every project's
+	// startup, so no other truthy value (1, "true") may widen its scope.
+	const global = bank === globalBank ? "1" : `(json_type(${metadata}, '$.global') IS 'true')`;
 	const superseded = columns.has("superseded_by") ? "(COALESCE(trim(superseded_by), '') <> '')" : "0";
 	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
 	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
