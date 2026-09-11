@@ -153,9 +153,9 @@ function isExpired(validUntil: string, now: Date): boolean {
 	return Number.isFinite(parsed) && parsed <= now.getTime();
 }
 
-/** SQLite datetime() text for a Date. JS compares these strings exactly as the SQL compares datetime() output. */
+/** sqlTime() text for a Date. JS compares these strings exactly as the SQL compares sqlTime() output. */
 function sqliteTime(date: Date): string {
-	return date.toISOString().slice(0, 19).replace("T", " ");
+	return date.toISOString().slice(0, 23).replace("T", " ");
 }
 
 /** The project window over SQLite's own parse of the timestamp; null means SQLite could not parse it. */
@@ -228,15 +228,19 @@ function tableColumns(db: Database, table: string): Set<string> {
 	);
 }
 
+// SQLite's date parser with millisecond text output, the resolution of the
+// startup clock. Every timestamp comparison goes through this one format, and
+// JS formats its own Date values the same way (sqliteTime).
+const sqlTime = (expr: string): string => `strftime('%Y-%m-%d %H:%M:%f', ${expr})`;
 // Global curated preferences, corrections, and identities are durable policy:
 // keep old and unparseable timestamps, never future ones (param: now). Project
 // rows stay inside the startup lookback window (params: cutoff, now).
-const GLOBAL_TIME_SQL = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
-const PROJECT_TIME_SQL = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
+const GLOBAL_TIME_SQL = `(timestamp IS NULL OR ${sqlTime("timestamp")} IS NULL OR ${sqlTime("timestamp")} <= ${sqlTime("?")})`;
+const PROJECT_TIME_SQL = `(${sqlTime("timestamp")} >= ${sqlTime("?")} AND ${sqlTime("timestamp")} <= ${sqlTime("?")})`;
 
 /** Every column, plus the admission inputs computed in SQLite that rowToMemory decides on. */
 function startupSelect(meta: { select: string }, columns: Set<string>): string {
-	return `*, ${meta.select}${columns.has("timestamp") ? ", datetime(timestamp) AS startup_ts" : ""}`;
+	return `*, ${meta.select}${columns.has("timestamp") ? `, ${sqlTime("timestamp")} AS startup_ts` : ""}`;
 }
 
 // Use guarded JSON extraction so one malformed metadata blob cannot turn a
@@ -323,7 +327,7 @@ function boundedProjectOmissionCount(db: Database, table: string, columns: Set<s
 		projectScope,
 		// A global curated row its own rule admits is not a project omission; a future one is.
 		`NOT (${globalScope} AND ${GLOBAL_TIME_SQL})`,
-		"(datetime(timestamp) IS NULL OR datetime(timestamp) < datetime(?) OR datetime(timestamp) > datetime(?))",
+		`(${sqlTime("timestamp")} IS NULL OR ${sqlTime("timestamp")} < ${sqlTime("?")} OR ${sqlTime("timestamp")} > ${sqlTime("?")})`,
 	];
 	conditions.push(`NOT ${meta.superseded}`);
 	try {

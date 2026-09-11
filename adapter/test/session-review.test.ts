@@ -224,18 +224,23 @@ describe("SessionStart bounded metadata recall", () => {
 				add(fx, "rfc", "project fact with an RFC 2822 timestamp", { kind: "fact", cwd: fx.root }, "Wed, 09 Sep 2026 00:00:00 GMT");
 				add(fx, "double-t", "global preference with a doubled T", { kind: "preference" }, "2027-01-01TT00:00:00");
 				add(fx, "control", "project fact with an ISO timestamp", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+				// Half a second ahead of now: a whole-second comparison would call these "now".
+				add(fx, "sub-second-global", "global preference half a second ahead", { kind: "preference" }, "2026-09-10T00:00:00.500Z");
+				add(fx, "sub-second-project", "project fact half a second ahead", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.500Z");
 				const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), ...(fallback ? { startupQueryExecutor: forceFallback } : {}) });
 				return output.hookSpecificOutput.additionalContext;
 			} finally { close(fx); }
 		};
 		const filtered = await run(false);
 		const fallback = await run(true);
-		for (const marker of ["project fact with an RFC 2822 timestamp", "global preference with a doubled T", "project fact with an ISO timestamp"]) {
+		for (const marker of ["project fact with an RFC 2822 timestamp", "global preference with a doubled T", "project fact with an ISO timestamp", "global preference half a second ahead", "project fact half a second ahead"]) {
 			expect(fallback.includes(marker)).toBe(filtered.includes(marker));
 		}
 		expect(filtered).toContain("project fact with an ISO timestamp");
 		expect(filtered).not.toContain("project fact with an RFC 2822 timestamp");
 		expect(filtered).not.toContain("global preference with a doubled T");
+		expect(filtered).not.toContain("global preference half a second ahead");
+		expect(filtered).not.toContain("project fact half a second ahead");
 	});
 
 	it("counts a future global row that matches the project as omitted", async () => {
