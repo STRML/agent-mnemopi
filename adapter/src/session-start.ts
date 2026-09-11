@@ -33,6 +33,10 @@ const ADMITTED_PROJECT_KINDS = new Set([...PROJECT_KINDS, ...INDEX_KINDS]);
 const INDEX_RESERVE_CHARS = 1800;
 const INDEX_TITLE_CHARS = 60;
 const INDEX_HEADING = "MEMORY INDEX (titles only; fetch a body with mnemopi_recall on its title):";
+const demotedNote = (count: number): string => `STARTUP ROWS LISTED BY TITLE ONLY: count=${count}; bodies did not fit the startup budget`;
+const indexFooter = (count: number): string => `+${count} more not listed; use mnemopi_recall with a title or topic`;
+/** Room a listing needs for its note, heading, and count line, sized for the largest possible counts. */
+const indexSkeleton = (rows: number): number => demotedNote(rows).length + INDEX_HEADING.length + indexFooter(rows).length + 3;
 
 // Startup reads in two phases. Phase 1 reads these decision columns for every
 // row, never content, and JS decides admission with the same JSON.parse the
@@ -376,18 +380,34 @@ function tierOf(row: StartupMemory): number {
 
 /** A one-line title: frontmatter description, then name, then the first body line without heading marks. */
 function contentTitle(content: string): string {
-	let lines = content.split("\n");
-	if (lines[0]?.trim() === "---") {
-		const end = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
-		const frontmatter = end > 0 ? lines.slice(1, end) : [];
-		for (const key of ["description", "name"]) {
-			const value = frontmatter.find(line => line.startsWith(`${key}:`))?.slice(key.length + 1).trim().replace(/^["']|["']$/g, "");
-			// A folded or literal block scalar keeps its text on later lines.
-			if (value && !/^[>|][-+]?$/.test(value)) return value;
-		}
-		if (end > 0) lines = lines.slice(end + 1);
+	const lines = content.split("\n");
+	if (lines[0]?.trim() !== "---") return firstLine(lines);
+	// An unterminated block runs to the end of the document; its opener is never a title.
+	const close = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
+	const frontmatter = lines.slice(1, close > 0 ? close : lines.length);
+	for (const key of ["description", "name"]) {
+		const value = frontmatterValue(frontmatter, key);
+		if (value) return value;
 	}
+	return firstLine(close > 0 ? lines.slice(close + 1) : frontmatter);
+}
+
+function firstLine(lines: readonly string[]): string {
 	return (lines.find(line => line.trim()) ?? "").replace(/^\s*#{1,6}\s+/, "").trim();
+}
+
+/** A top-level frontmatter value; a folded or literal block scalar is read from its indented lines. */
+function frontmatterValue(frontmatter: readonly string[], key: string): string {
+	const at = frontmatter.findIndex(line => line.startsWith(`${key}:`));
+	if (at < 0) return "";
+	const inline = frontmatter[at].slice(key.length + 1).trim();
+	if (!/^[>|][-+]?$/.test(inline)) return inline.replace(/^["']|["']$/g, "");
+	const block: string[] = [];
+	for (const line of frontmatter.slice(at + 1)) {
+		if (line.trim() && !/^\s/.test(line)) break;
+		block.push(line.trim());
+	}
+	return block.filter(Boolean).join(" ");
 }
 
 function indexTitle(row: StartupMemory): string {
@@ -405,10 +425,9 @@ function fullLine(row: StartupMemory): string {
 /** Title lines for rows without room for a body, plus a count of any that did not fit. */
 function indexSection(listed: readonly StartupMemory[], demoted: number, room: number): string[] {
 	if (listed.length === 0) return [];
-	const lines = demoted > 0 ? [`STARTUP ROWS LISTED BY TITLE ONLY: count=${demoted}; bodies did not fit the startup budget`] : [];
+	const lines = demoted > 0 ? [demotedNote(demoted)] : [];
 	lines.push(INDEX_HEADING);
-	const footer = (count: number): string => `+${count} more not listed; use mnemopi_recall with a title or topic`;
-	let remaining = room - lines.reduce((sum, line) => sum + line.length + 1, 0) - (footer(listed.length).length + 1);
+	let remaining = room - lines.reduce((sum, line) => sum + line.length + 1, 0) - (indexFooter(listed.length).length + 1);
 	let shown = 0;
 	for (const row of listed) {
 		const line = `- ${indexTitle(row)}`;
@@ -417,7 +436,7 @@ function indexSection(listed: readonly StartupMemory[], demoted: number, room: n
 		remaining -= line.length + 1;
 		shown += 1;
 	}
-	if (shown < listed.length) lines.push(footer(listed.length - shown));
+	if (shown < listed.length) lines.push(indexFooter(listed.length - shown));
 	return lines;
 }
 
@@ -432,7 +451,11 @@ function formatContext(rows: readonly StartupMemory[], notes: readonly string[],
 	const indexRows = rows.filter(row => tierOf(row) >= 2);
 	let used = header.join("\n").length;
 	const indexNeed = indexRows.length === 0 ? 0 : indexRows.reduce((sum, row) => sum + indexTitle(row).length + 3, INDEX_HEADING.length + 1);
-	const reserve = Math.min(INDEX_RESERVE_CHARS, indexNeed, Math.max(0, maxChars - used));
+	const fullNeed = fullRows.reduce((sum, row) => sum + fullLine(row).length + 1, 0);
+	// A listing always keeps room for its note, heading, and count, so a row that is
+	// neither shown in full nor titled is still counted, never silently dropped.
+	const needsListing = indexRows.length > 0 || used + fullNeed > maxChars;
+	const reserve = needsListing ? Math.min(Math.max(indexSkeleton(rows.length), Math.min(INDEX_RESERVE_CHARS, indexNeed)), Math.max(0, maxChars - used)) : 0;
 	const body: string[] = [];
 	const demoted: StartupMemory[] = [];
 	for (const row of fullRows) {

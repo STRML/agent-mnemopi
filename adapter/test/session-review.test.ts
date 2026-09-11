@@ -547,6 +547,37 @@ describe("SessionStart memory index", () => {
 		} finally { close(fx); }
 	});
 
+	it("accounts for every admitted row as full, titled, or counted", async () => {
+		const fx = fixture();
+		try {
+			for (let i = 0; i < 39; i++) add(fx, `h${String(i).padStart(2, "0")}`, `handoff number ${i} ${"z".repeat(200)}`, { kind: "handoff", cwd: fx.root }, new Date(Date.UTC(2026, 8, 9) - i * 60_000).toISOString());
+			add(fx, "the-fact", "the one project fact", { kind: "fact", cwd: fx.root }, "2026-09-08T00:00:00.000Z");
+			const context = await start(fx);
+			const lines = context.split("\n");
+			const full = lines.filter(line => line.startsWith("[bank=")).length;
+			const titled = lines.filter(line => line.startsWith("- ")).length;
+			const counted = Number(/^\+(\d+) more/m.exec(context)?.[1] ?? 0);
+			expect(full + titled + counted).toBe(40);
+			expect(context.length).toBeLessThanOrEqual(6000);
+		} finally { close(fx); }
+	});
+
+	it("titles unterminated frontmatter and block scalars from their text", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "unterminated", "---\nno closing fence here\nmore text", "2026-09-09T00:00:00.000Z");
+			migrated(fx, "unterminated-name", "---\nname: unterminated-name\nbody", "2026-09-08T00:00:00.000Z");
+			migrated(fx, "folded", "---\ndescription: >-\n  Folded description\n  continues here\nname: folded-name\n---\nbody", "2026-09-07T00:00:00.000Z");
+			migrated(fx, "literal", "---\ndescription: |\n  Literal first line\n  second line\n---\nbody", "2026-09-06T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("- no closing fence here");
+			expect(context).not.toContain("\n- ---");
+			expect(context).toContain("- unterminated-name");
+			expect(context).toContain("- Folded description continues here");
+			expect(context).toContain("- Literal first line second line");
+		} finally { close(fx); }
+	});
+
 	it("counts migrated memories outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {
