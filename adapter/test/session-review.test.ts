@@ -261,12 +261,12 @@ describe("SessionStart bounded metadata recall", () => {
 			{ id: "kind-array", metadata: { kind: ["fact"], cwd: "ROOT" } },
 			{ id: "kind-object", metadata: { kind: { name: "fact" }, cwd: "ROOT" }, memoryType: "fact" },
 			{ id: "kind-number", metadata: { kind: 7, cwd: "ROOT" }, memoryType: "fact" },
-			{ id: "kind-nbsp", metadata: { kind: " fact", cwd: "ROOT" } },
+			{ id: "kind-nbsp", metadata: { kind: "\u00a0fact", cwd: "ROOT" } },
 			{ id: "kind-upper-spaced", metadata: { kind: " FACT ", cwd: "ROOT" } },
 			{ id: "task-key-array", metadata: { kind: "status", cwd: "ROOT", task_key: ["tracked"] } },
 			{ id: "task-key-zero", metadata: { kind: "status", cwd: "ROOT", task_key: 0 } },
 			{ id: "cwd-array", metadata: { kind: "fact", cwd: ["ROOT"] } },
-			{ id: "superseded-nbsp", metadata: { kind: "fact", cwd: "ROOT" }, superseded: " " },
+			{ id: "superseded-nbsp", metadata: { kind: "fact", cwd: "ROOT" }, superseded: "\u00a0" },
 		];
 		const forceFallback = (db: Database, sql: string, params: readonly unknown[], phase: "filtered" | "fallback"): Array<Record<string, unknown>> => {
 			if (phase === "filtered") throw new Error("forced");
@@ -302,6 +302,22 @@ describe("SessionStart bounded metadata recall", () => {
 			expect(output).toContain("preference flagged global with true");
 			expect(output).not.toContain("preference flagged global with 1");
 			expect(output).not.toContain("preference flagged global with a string");
+		} finally { close(fx); }
+	});
+
+	it("never counts an empty-looking task_key as task state", async () => {
+		const fx = fixture();
+		try {
+			// A task_key admits a row of any kind in full, so a junk value must not let an episode in.
+			add(fx, "tk-empty-array", "episode with an empty array task key", { kind: "episode", cwd: fx.root, task_key: [] }, "2026-09-09T00:00:00.000Z");
+			add(fx, "tk-blank-array", "episode with a blank array task key", { kind: "episode", cwd: fx.root, task_key: [""] }, "2026-09-09T00:00:00.000Z");
+			add(fx, "tk-nbsp", "episode with a non-breaking-space task key", { kind: "episode", cwd: fx.root, task_key: "\u00a0" }, "2026-09-09T00:00:00.000Z");
+			add(fx, "tk-real", "episode with a real task key", { kind: "episode", cwd: fx.root, task_key: "tracked" }, "2026-09-09T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("episode with a real task key");
+			expect(context).not.toContain("episode with an empty array task key");
+			expect(context).not.toContain("episode with a blank array task key");
+			expect(context).not.toContain("episode with a non-breaking-space task key");
 		} finally { close(fx); }
 	});
 

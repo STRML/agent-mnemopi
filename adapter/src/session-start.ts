@@ -243,6 +243,12 @@ function startupSelect(meta: { select: string }, columns: Set<string>): string {
 	return `*, ${meta.select}${columns.has("timestamp") ? `, ${sqlTime("timestamp")} AS startup_ts` : ""}`;
 }
 
+// SQLite trim() strips only spaces; JS trim() strips every Unicode space and
+// line terminator. jsTrim strips the same set, so a value counts as blank here
+// exactly when String.prototype.trim would make it blank.
+const JS_WHITESPACE = "char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279)";
+const jsTrim = (expr: string): string => `trim(${expr}, ${JS_WHITESPACE})`;
+
 // Use guarded JSON extraction so one malformed metadata blob cannot turn a
 // whole bank into a startup failure. Every admission input derived from
 // metadata is computed here, once, in SQLite. The filtered query uses these
@@ -258,14 +264,18 @@ function metadataSql(columns: Set<string>, bank: string, globalBank: string): { 
 	// JSON null, false, 0, and "" count as absent, so a falsy kind falls back to memory_type.
 	const field = (key: string): string =>
 		`(CASE WHEN json_type(${metadata}, '${key}') IN ('null', 'false') THEN NULL WHEN json_type(${metadata}, '${key}') IN ('integer', 'real') AND ${json(key)} = 0 THEN NULL ELSE NULLIF(CAST(${json(key)} AS TEXT), '') END)`;
+	// An array or object task_key never counts, and it does not fall through to
+	// taskKey either: a task_key admits a row of any kind in full, so only a real
+	// scalar may open that door.
+	const scalarText = (key: string): string => `(CASE WHEN json_type(${metadata}, '${key}') IN ('array', 'object') THEN '' ELSE ${field(key)} END)`;
 	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
-	const kind = `lower(trim(COALESCE(${field("$.kind")}, ${memoryType}, '')))`;
-	const taskKey = `trim(COALESCE(${field("$.task_key")}, ${field("$.taskKey")}, ''))`;
+	const kind = `lower(${jsTrim(`COALESCE(${field("$.kind")}, ${memoryType}, '')`)})`;
+	const taskKey = jsTrim(`COALESCE(${scalarText("$.task_key")}, ${scalarText("$.taskKey")}, '')`);
 	const cwd = `COALESCE(${field("$.cwd")}, '')`;
 	// Only JSON true marks a row global. A global row reaches every project's
 	// startup, so no other truthy value (1, "true") may widen its scope.
 	const global = bank === globalBank ? "1" : `(json_type(${metadata}, '$.global') IS 'true')`;
-	const superseded = columns.has("superseded_by") ? "(COALESCE(trim(superseded_by), '') <> '')" : "0";
+	const superseded = columns.has("superseded_by") ? `(COALESCE(${jsTrim("superseded_by")}, '') <> '')` : "0";
 	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
 	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
 	// cwd as a project candidate and let rowToMemory perform the authoritative
