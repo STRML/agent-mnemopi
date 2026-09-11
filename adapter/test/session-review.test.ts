@@ -650,6 +650,30 @@ describe("SessionStart memory index", () => {
 		} finally { close(fx); }
 	});
 
+	it("admits rows recorded in a subdirectory of the project, but not a sibling", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "sub", "# Memory recorded under adapter", "2026-09-09T00:00:00.000Z", path.join(fx.root, "adapter"));
+			add(fx, "sub-fact", "fact recorded under scripts", { kind: "fact", cwd: path.join(fx.root, "scripts") }, "2026-09-09T00:00:00.000Z");
+			add(fx, "sibling-fact", "fact from a sibling directory", { kind: "fact", cwd: `${fx.root}-other` }, "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("- Memory recorded under adapter");
+			expect(context).toContain("- fact recorded under scripts");
+			expect(context).not.toContain("fact from a sibling directory");
+		} finally { close(fx); }
+	});
+
+	it("reports admitted rows that have no content to show", async () => {
+		const fx = fixture();
+		try {
+			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["blank", "", "test", "2026-09-09T00:00:00.000Z", JSON.stringify({ kind: "handoff", cwd: fx.root }), "handoff"]);
+			add(fx, "real", "a handoff with content", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("a handoff with content");
+			expect(context).toContain("STARTUP ROWS WITHOUT CONTENT: bank=default table=working_memory count=1");
+		} finally { close(fx); }
+	});
+
 	it("counts migrated memories outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {

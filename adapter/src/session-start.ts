@@ -214,7 +214,10 @@ function admission(row: RawRow, bank: string, globalBank: string, projectRoot: s
 	if (global && CURATED_KINDS.has(kind) && notFuture(timestamp, now)) return decided("admit");
 	// Migrated memories record the project as resolved_cwd; cwd wins when both are set.
 	const cwd = text(metadata.cwd || metadata.resolved_cwd);
-	const projectMatch = cwd.length > 0 && path.resolve(cwd) === projectRoot;
+	// A row recorded in a subdirectory of the project belongs to the project; the
+	// separator keeps a sibling such as <root>-other out.
+	const resolved = cwd.length > 0 ? path.resolve(cwd) : "";
+	const projectMatch = resolved === projectRoot || (resolved.length > 0 && resolved.startsWith(`${projectRoot}${path.sep}`));
 	if (!projectMatch || !(ADMITTED_PROJECT_KINDS.has(kind) || taskKey.length > 0)) return decided("reject");
 	return decided(withinLookback(timestamp, now) ? "admit" : "omit_window");
 }
@@ -264,7 +267,7 @@ function tableColumns(db: Database, table: string): Set<string> {
 }
 
 /** Two-phase read of one table: decide on decision columns, then load detail for admitted rows. */
-function readTable(db: Database, table: string, bank: string, globalBank: string, projectRoot: string, now: Date): { rows: StartupMemory[]; omitted: number } {
+function readTable(db: Database, table: string, bank: string, globalBank: string, projectRoot: string, now: Date): { rows: StartupMemory[]; omitted: number; contentless: number } {
 	const columns = tableColumns(db, table);
 	const pick = (names: readonly string[]): string => names.filter(name => columns.has(name)).join(", ");
 	// Ordered by id only: startup sorts by parsed time in JS, so SQL never interprets a timestamp.
@@ -272,6 +275,7 @@ function readTable(db: Database, table: string, bank: string, globalBank: string
 	const detail = db.query(`SELECT ${pick(DETAIL_COLUMNS)} FROM ${table} WHERE id = ?`);
 	const rows: StartupMemory[] = [];
 	let omitted = 0;
+	let contentless = 0;
 	for (const row of candidates) {
 		const decision = admission(row, bank, globalBank, projectRoot, now);
 		if (decision.verdict === "omit_window") omitted += 1;
@@ -279,9 +283,11 @@ function readTable(db: Database, table: string, bank: string, globalBank: string
 		// Inside the read snapshot every phase-1 row is still present in phase 2; a
 		// missing one would carry no content, which toStartupMemory rejects.
 		const memory = toStartupMemory({ ...row, ...(detail.get(row.id as never) as RawRow | null) }, decision, bank, now);
+		// An admitted row with no text has nothing to show, and saying so beats dropping it.
 		if (memory) rows.push(memory);
+		else contentless += 1;
 	}
-	return { rows, omitted };
+	return { rows, omitted, contentless };
 }
 
 function readBank(bank: string, dbPath: string, globalBank: string, projectRoot: string, now: Date, canonical: boolean): BankRead {
@@ -304,6 +310,7 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 					const read = readTable(db, table, bank, globalBank, projectRoot, now);
 					rows.push(...read.rows);
 					if (read.omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${read.omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
+					if (read.contentless > 0) notes.push(`STARTUP ROWS WITHOUT CONTENT: bank=${bank} table=${table} count=${read.contentless}; admitted but the row has no text to show`);
 				}
 				return { bank, dbPath, rows, ...(notes.length > 0 ? { notes } : {}) };
 			})();
