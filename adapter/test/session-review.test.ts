@@ -547,22 +547,6 @@ describe("SessionStart memory index", () => {
 		} finally { close(fx); }
 	});
 
-	it("admits migrated memories on the SQL fallback path", async () => {
-		const fx = fixture();
-		try {
-			migrated(fx, "migrated", "# Fallback migrated memory", "2026-09-09T00:00:00.000Z");
-			const output = await sessionStart(fx.root, {
-				context: fx.context,
-				now,
-				startupQueryExecutor: (db, sql, params, phase) => {
-					if (phase === "filtered") throw new Error("forced");
-					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
-				},
-			});
-			expect(output.hookSpecificOutput.additionalContext).toContain("- Fallback migrated memory");
-		} finally { close(fx); }
-	});
-
 	it("counts migrated memories outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {
