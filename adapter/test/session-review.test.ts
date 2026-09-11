@@ -248,6 +248,43 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("admits the same rows on both paths for any metadata shape", async () => {
+		// Each shape once split the paths: SQLite and JS coerce arrays, objects,
+		// numbers, case, and Unicode whitespace differently.
+		const shapes: Array<{ id: string; metadata: Record<string, unknown>; memoryType?: string; superseded?: string }> = [
+			{ id: "baseline", metadata: { kind: "fact", cwd: "ROOT" } },
+			{ id: "kind-array", metadata: { kind: ["fact"], cwd: "ROOT" } },
+			{ id: "kind-object", metadata: { kind: { name: "fact" }, cwd: "ROOT" }, memoryType: "fact" },
+			{ id: "kind-number", metadata: { kind: 7, cwd: "ROOT" }, memoryType: "fact" },
+			{ id: "kind-nbsp", metadata: { kind: " fact", cwd: "ROOT" } },
+			{ id: "kind-upper-spaced", metadata: { kind: " FACT ", cwd: "ROOT" } },
+			{ id: "task-key-array", metadata: { kind: "status", cwd: "ROOT", task_key: ["tracked"] } },
+			{ id: "task-key-zero", metadata: { kind: "status", cwd: "ROOT", task_key: 0 } },
+			{ id: "cwd-array", metadata: { kind: "fact", cwd: ["ROOT"] } },
+			{ id: "superseded-nbsp", metadata: { kind: "fact", cwd: "ROOT" }, superseded: " " },
+		];
+		const forceFallback = (db: Database, sql: string, params: readonly unknown[], phase: "filtered" | "fallback"): Array<Record<string, unknown>> => {
+			if (phase === "filtered") throw new Error("forced");
+			return db.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
+		};
+		const run = async (fallback: boolean): Promise<string> => {
+			const fx = fixture();
+			try {
+				for (const shape of shapes) {
+					const metadata = JSON.parse(JSON.stringify(shape.metadata).replaceAll("ROOT", fx.root.replaceAll("\\", "\\\\")));
+					fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?)", [shape.id, `SHAPE-${shape.id}`, "test", "2026-09-09T00:00:00.000Z", JSON.stringify(metadata), shape.memoryType ?? null, shape.superseded ?? null]);
+				}
+				const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), ...(fallback ? { startupQueryExecutor: forceFallback } : {}) });
+				return output.hookSpecificOutput.additionalContext;
+			} finally { close(fx); }
+		};
+		const filtered = await run(false);
+		const fallback = await run(true);
+		expect(filtered).toContain("SHAPE-baseline");
+		const disagreements = shapes.map(shape => `SHAPE-${shape.id}`).filter(marker => filtered.includes(marker) !== fallback.includes(marker));
+		expect(disagreements).toEqual([]);
+	});
+
 	it("counts project facts outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {

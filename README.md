@@ -52,8 +52,9 @@ global preferences, corrections, and identities plus null or malformed
 timestamps for safe classification), and backs off failed review sweeps from
 one minute up to one hour instead of retrying every session. If a bounded
 project sweep omits rows, startup reports the omission in its untrusted
-context diagnostics. If SQLite cannot execute the JSON prefilter, startup uses
-a capped compatibility query and reports that degraded path visibly; callback
+context diagnostics. Admission inputs are computed once, in SQLite, so
+if the filtered query fails, the capped fallback that reruns it without its
+filter admits the same rows and reports that degraded path visibly; callback
 recall is selected against the concrete project path rather than synthetic
 startup wording.
 

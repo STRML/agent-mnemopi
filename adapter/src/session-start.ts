@@ -171,26 +171,25 @@ function kindOf(metadata: Record<string, unknown>, row: RawRow): string {
 	return text(metadata.kind || row.memory_type).trim().toLowerCase();
 }
 
-function rowToMemory(row: RawRow, bank: string, globalBank: string, projectRoot: string, now: Date): StartupMemory | null {
+function rowToMemory(row: RawRow, bank: string, projectRoot: string, now: Date): StartupMemory | null {
 	const id = text(row.id).trim();
 	const content = text(row.content);
 	if (!id || !content) return null;
 	const metadata = parseMetadata(row.metadata_json);
 	const timestamp = text(row.timestamp) || null;
 	const age = ageDays(timestamp ?? "", now);
-	const cwd = text(metadata.cwd);
-	const taskKey = text(metadata.task_key || metadata.taskKey).trim();
-	const kind = kindOf(metadata, row);
-	const global = bank === globalBank || Boolean(metadata.global === true);
+	// Admission reads only the startup_* values the query computed in SQLite, so
+	// the filtered and fallback paths decide on identical data (see metadataSql).
+	const kind = text(row.startup_kind);
+	const taskKey = text(row.startup_task_key);
+	const cwd = text(row.startup_cwd);
 	const projectMatch = cwd.length > 0 && path.resolve(cwd) === projectRoot;
-	// Both queries select SQLite's own parse as startup_ts, so the time rules here
-	// see exactly what the SQL predicates saw, on the filtered and fallback paths.
 	const timed = "startup_ts" in row;
 	const startupTs = typeof row.startup_ts === "string" ? row.startup_ts : null;
-	const globalAdmit = global && CURATED_KINDS.has(kind) && (!timed || notFuture(startupTs, now));
+	const globalAdmit = Number(row.startup_global) === 1 && CURATED_KINDS.has(kind) && (!timed || notFuture(startupTs, now));
 	const projectAdmit = projectMatch && (PROJECT_KINDS.has(kind) || taskKey.length > 0) && (!timed || withinLookback(startupTs, now));
 	if (!globalAdmit && !projectAdmit) return null;
-	if (text(row.superseded_by).trim()) return null;
+	if (Number(row.startup_superseded) === 1) return null;
 	return {
 		id,
 		content,
@@ -234,38 +233,41 @@ function tableColumns(db: Database, table: string): Set<string> {
 const GLOBAL_TIME_SQL = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
 const PROJECT_TIME_SQL = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
 
-/** Every column, plus SQLite's own parse of the timestamp for the JS time rules. */
-function startupColumns(columns: Set<string>): string {
-	return columns.has("timestamp") ? "*, datetime(timestamp) AS startup_ts" : "*";
+/** Every column, plus the admission inputs computed in SQLite that rowToMemory decides on. */
+function startupSelect(meta: { select: string }, columns: Set<string>): string {
+	return `*, ${meta.select}${columns.has("timestamp") ? ", datetime(timestamp) AS startup_ts" : ""}`;
 }
 
 // Use guarded JSON extraction so one malformed metadata blob cannot turn a
-// whole bank into a startup failure. JS still performs the authoritative path,
-// type, and time checks after this SQL-side candidate reduction, so every
-// expression here must admit at least what rowToMemory admits. Both startup
-// queries build their predicates here so they cannot drift from each other.
-function metadataSql(columns: Set<string>, bank: string, globalBank: string): { globalScope: string; projectScope: string } {
+// whole bank into a startup failure. Every admission input is computed here,
+// once, in SQLite: both queries filter on these expressions and select them as
+// startup_* columns, and rowToMemory decides on the selected values instead of
+// re-deriving them. SQLite and JS coerce arrays, numbers, case, and Unicode
+// whitespace differently, so deriving an input in both places cannot agree.
+function metadataSql(columns: Set<string>, bank: string, globalBank: string): { select: string; globalScope: string; projectScope: string; superseded: string } {
 	const metadata = columns.has("metadata_json")
 		? "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END"
 		: "'{}'";
 	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
-	// Mirror JS `||`: JSON null, false, 0, and "" count as absent, so a falsy
-	// kind falls back to memory_type here exactly as it does in kindOf.
+	// JSON null, false, 0, and "" count as absent, so a falsy kind falls back to memory_type.
 	const field = (key: string): string =>
 		`(CASE WHEN json_type(${metadata}, '${key}') IN ('null', 'false') THEN NULL WHEN json_type(${metadata}, '${key}') IN ('integer', 'real') AND ${json(key)} = 0 THEN NULL ELSE NULLIF(CAST(${json(key)} AS TEXT), '') END)`;
 	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
 	const kind = `lower(trim(COALESCE(${field("$.kind")}, ${memoryType}, '')))`;
 	const taskKey = `trim(COALESCE(${field("$.task_key")}, ${field("$.taskKey")}, ''))`;
-	const cwd = field("$.cwd");
-	const global = bank === globalBank ? "1 = 1" : `COALESCE(${json("$.global")}, 0) = 1`;
+	const cwd = `COALESCE(${field("$.cwd")}, '')`;
+	const global = bank === globalBank ? "1" : `(COALESCE(${json("$.global")}, 0) = 1)`;
+	const superseded = columns.has("superseded_by") ? "(COALESCE(trim(superseded_by), '') <> '')" : "0";
 	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
 	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
 	// cwd as a project candidate and let rowToMemory perform the authoritative
 	// path comparison. This is intentionally conservative: unrelated project
 	// rows may be read, but they are bounded below and discarded before output.
 	return {
+		select: `${kind} AS startup_kind, ${taskKey} AS startup_task_key, ${cwd} AS startup_cwd, ${global} AS startup_global, ${superseded} AS startup_superseded`,
 		globalScope: `(${global} AND ${kind} IN (${sqlKindList(CURATED_KINDS)}))`,
-		projectScope: `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''))`,
+		projectScope: `(${cwd} <> '' AND (${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''))`,
+		superseded,
 	};
 }
 
@@ -276,7 +278,8 @@ function startupQuery(
 	globalBank: string,
 	now: Date,
 ): { sql: string; params: unknown[] } {
-	const { globalScope, projectScope } = metadataSql(columns, bank, globalBank);
+	const meta = metadataSql(columns, bank, globalBank);
+	const { globalScope, projectScope } = meta;
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const params: unknown[] = [];
 	let conditions: string[];
@@ -286,18 +289,17 @@ function startupQuery(
 	} else {
 		conditions = [`(${globalScope} OR ${projectScope})`];
 	}
-	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
+	conditions.push(`NOT ${meta.superseded}`);
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	return { sql: `SELECT ${startupColumns(columns)} FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
+	return { sql: `SELECT ${startupSelect(meta, columns)} FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
 }
 
-function fallbackQuery(table: string, columns: Set<string>): { sql: string; params: unknown[] } {
-	// Without JSON1 we cannot distinguish durable global rows from project
-	// rows. Keep the compatibility path bounded and report any cap omission;
-	// rowToMemory still applies the same JS curation rules. This path is rare,
-	// and the diagnostic makes its conservative loss visible to the host.
+function fallbackQuery(table: string, columns: Set<string>, bank: string, globalBank: string): { sql: string; params: unknown[] } {
+	// The filtered query's select list without its WHERE clause. rowToMemory
+	// decides on the same startup_* values, so this path admits exactly what the
+	// filtered path would, up to the row cap; any cap omission is reported.
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	return { sql: `SELECT ${startupColumns(columns)} FROM ${table} ORDER BY ${order} LIMIT ?`, params: [SQL_FALLBACK_ROW_LIMIT] };
+	return { sql: `SELECT ${startupSelect(metadataSql(columns, bank, globalBank), columns)} FROM ${table} ORDER BY ${order} LIMIT ?`, params: [SQL_FALLBACK_ROW_LIMIT] };
 }
 
 function fallbackOmissionCount(db: Database, table: string): number {
@@ -312,7 +314,8 @@ function fallbackOmissionCount(db: Database, table: string): number {
 
 function boundedProjectOmissionCount(db: Database, table: string, columns: Set<string>, now: Date, bank: string, globalBank: string): number {
 	if (!columns.has("timestamp") || !columns.has("metadata_json")) return 0;
-	const { globalScope, projectScope } = metadataSql(columns, bank, globalBank);
+	const meta = metadataSql(columns, bank, globalBank);
+	const { globalScope, projectScope } = meta;
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const conditions = [
 		projectScope,
@@ -320,7 +323,7 @@ function boundedProjectOmissionCount(db: Database, table: string, columns: Set<s
 		`NOT (${globalScope} AND ${GLOBAL_TIME_SQL})`,
 		"(datetime(timestamp) IS NULL OR datetime(timestamp) < datetime(?) OR datetime(timestamp) > datetime(?))",
 	];
-	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
+	conditions.push(`NOT ${meta.superseded}`);
 	try {
 		const result = db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${conditions.join(" AND ")}`).get(now.toISOString(), cutoff, now.toISOString()) as { count?: unknown } | null;
 		const count = Number(result?.count ?? 0);
@@ -360,16 +363,15 @@ function readBank(
 						: db.query(query.sql).all(...query.params) as RawRow[];
 					rows.push(...result as RawRow[]);
 				} catch {
-					// JSON1 is available in current SQLite, but old stores may be
-					// opened by a runtime without it. Use the bounded compatibility
-					// query; any cap omission is surfaced in startup diagnostics.
-					const fallback = fallbackQuery(table, columns);
+					// Keep startup working if the filtered query fails: rerun it without
+					// its WHERE clause, capped; any cap omission is reported.
+					const fallback = fallbackQuery(table, columns, bank, globalBank);
 					const result = startupQueryExecutor
 						? startupQueryExecutor(db, fallback.sql, fallback.params, "fallback")
 						: db.query(fallback.sql).all(...fallback.params) as RawRow[];
 					rows.push(...result as RawRow[]);
 					const omitted = fallbackOmissionCount(db, table);
-					if (omitted > 0) notes.push(`STARTUP COMPATIBILITY ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; SQLite JSON filtering was unavailable and the ${SQL_FALLBACK_ROW_LIMIT}-row safety cap applied`);
+					if (omitted > 0) notes.push(`STARTUP COMPATIBILITY ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; the filtered startup query failed and the ${SQL_FALLBACK_ROW_LIMIT}-row safety cap applied`);
 					diagnostics.push(`STARTUP SQL FILTER FALLBACK: bank=${bank} table=${table}; JS metadata filtering remained authoritative`);
 				}
 				const omitted = boundedProjectOmissionCount(db, table, columns, now, bank, globalBank);
@@ -378,7 +380,7 @@ function readBank(
 			return {
 				bank,
 				dbPath,
-				rows: rows.map(row => rowToMemory(row, bank, globalBank, projectRoot, now)).filter((row): row is StartupMemory => row !== null),
+				rows: rows.map(row => rowToMemory(row, bank, projectRoot, now)).filter((row): row is StartupMemory => row !== null),
 				...(notes.length > 0 ? { notes } : {}),
 				...(diagnostics.length > 0 ? { diagnostics } : {}),
 			};

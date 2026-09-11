@@ -50,8 +50,11 @@ Review does not prune or repair memories. Startup pushes its metadata and
 timestamp filters into SQLite, keeps a one-year timestamp window for
 project-scoped rows while retaining durable global preferences, corrections,
 and identities, and records bounded project omissions plus failed review
-attempts with bounded exponential retry backoff. A JSON-filter fallback is
-capped and visible in the hook diagnostics, and callback selection uses the
+attempts with bounded exponential retry backoff. Every admission input
+is computed once in SQLite and selected as a `startup_*` column that
+rowToMemory decides on, so the capped fallback (the filtered query without its
+WHERE clause) admits the same rows. The fallback is visible in the hook
+diagnostics, and callback selection uses the
 concrete project path.
 
 `context` is read-only and resolves OMP global/project settings, the native
