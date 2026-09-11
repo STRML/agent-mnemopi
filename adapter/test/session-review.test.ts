@@ -670,7 +670,22 @@ describe("SessionStart memory index", () => {
 			add(fx, "real", "a handoff with content", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
 			const context = await start(fx);
 			expect(context).toContain("a handoff with content");
-			expect(context).toContain("STARTUP ROWS WITHOUT CONTENT: bank=default table=working_memory count=1");
+			expect(context).toContain("STARTUP ROWS WITHOUT CONTENT: count=1");
+		} finally { close(fx); }
+	});
+
+	it("accounts for a contentless row even when its note is dropped", async () => {
+		const fx = fixture();
+		try {
+			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["blank", "", "test", "2026-09-09T00:00:00.000Z", JSON.stringify({ kind: "handoff", cwd: fx.root }), "handoff"]);
+			add(fx, "real", "a handoff with content", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now, maxChars: 256 })).hookSpecificOutput.additionalContext;
+			const shown = context.split("\n").filter(line => line.startsWith("[bank=") || line.startsWith("- ")).length;
+			const counted = Number(/^\+(\d+) more not listed/m.exec(context)?.[1] ?? 0);
+			const truncated = Number(/TRUNCATED: (\d+) admitted rows?/.exec(context)?.[1] ?? 0);
+			const reported = Number(/STARTUP ROWS WITHOUT CONTENT: count=(\d+)/.exec(context)?.[1] ?? 0);
+			expect(shown + counted + truncated + reported).toBe(2);
+			expect(context.length).toBeLessThanOrEqual(256);
 		} finally { close(fx); }
 	});
 
