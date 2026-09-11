@@ -52,8 +52,10 @@ project-scoped rows while retaining durable global preferences, corrections,
 and identities, and records bounded project omissions plus failed review
 attempts with bounded exponential retry backoff. Every admission input
 is computed once in SQLite and selected as a `startup_*` column that
-rowToMemory decides on, so the capped fallback (the filtered query without its
-WHERE clause) admits the same rows. The fallback is visible in the hook
+rowToMemory decides on; JS adds only the `path.resolve` comparison on cwd. So
+the capped fallback (the filtered query without its WHERE clause) makes the
+same decision for every row it returns, and rows past its 4096-row cap are
+counted and reported. The fallback is visible in the hook
 diagnostics, and callback selection uses the
 concrete project path.
 

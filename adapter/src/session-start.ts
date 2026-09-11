@@ -240,10 +240,11 @@ function startupSelect(meta: { select: string }, columns: Set<string>): string {
 }
 
 // Use guarded JSON extraction so one malformed metadata blob cannot turn a
-// whole bank into a startup failure. Every admission input is computed here,
-// once, in SQLite: both queries filter on these expressions and select them as
-// startup_* columns, and rowToMemory decides on the selected values instead of
-// re-deriving them. SQLite and JS coerce arrays, numbers, case, and Unicode
+// whole bank into a startup failure. Every admission input derived from
+// metadata is computed here, once, in SQLite. The filtered query uses these
+// expressions in its WHERE clause, both queries select them as startup_*
+// columns, and rowToMemory decides on the selected values instead of
+// re-deriving them. startupSelect adds startup_ts the same way. SQLite and JS coerce arrays, numbers, case, and Unicode
 // whitespace differently, so deriving an input in both places cannot agree.
 function metadataSql(columns: Set<string>, bank: string, globalBank: string): { select: string; globalScope: string; projectScope: string; superseded: string } {
 	const metadata = columns.has("metadata_json")
