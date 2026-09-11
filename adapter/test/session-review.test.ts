@@ -135,13 +135,14 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("injects project facts that match the project", async () => {
+	it("lists project facts in the startup index", async () => {
 		const fx = fixture();
 		try {
 			add(fx, "project-fact", "project fact about the repo", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.000Z");
 			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
 			expect(context).toContain("project fact about the repo");
-			expect(context).toContain("kind=fact");
+			expect(context).toContain("- project fact about the repo");
+			expect(context).not.toContain("kind=fact");
 		} finally { close(fx); }
 	});
 
@@ -457,6 +458,118 @@ describe("SessionStart bounded metadata recall", () => {
 			const failure = JSON.parse(readFileSync(path.join(reviewDir, "review-failure.json"), "utf8")) as { attempts: number; retryAt: string };
 			expect(failure.attempts).toBe(1);
 			expect(Date.parse(failure.retryAt)).toBeGreaterThan(now.getTime());
+		} finally { close(fx); }
+	});
+});
+
+describe("SessionStart memory index", () => {
+	const now = new Date("2026-09-10T00:00:00.000Z");
+	const start = async (fx: Fixture): Promise<string> =>
+		(await sessionStart(fx.root, { context: fx.context, now })).hookSpecificOutput.additionalContext;
+	const migrated = (fx: Fixture, id: string, content: string, timestamp: string, resolvedCwd = fx.root): void =>
+		add(fx, id, content, { kind: "claude-memory-markdown", resolved_cwd: resolvedCwd }, timestamp);
+
+	it("lists migrated memories that match the project through resolved_cwd", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "migrated", "# Deploy runbook\n\nBODY-SHOULD-NOT-APPEAR", "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("MEMORY INDEX");
+			expect(context).toContain("- Deploy runbook");
+			expect(context).not.toContain("BODY-SHOULD-NOT-APPEAR");
+		} finally { close(fx); }
+	});
+
+	it("ignores migrated memories that belong to another project", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "elsewhere", "# Other repo runbook", "2026-09-09T00:00:00.000Z", "/some/other/project");
+			add(fx, "cwd-wins", "# Migrated memory whose cwd points elsewhere", { kind: "claude-memory-markdown", cwd: "/some/other/project", resolved_cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).not.toContain("Other repo runbook");
+			expect(context).not.toContain("Migrated memory whose cwd points elsewhere");
+			expect(context).not.toContain("MEMORY INDEX");
+		} finally { close(fx); }
+	});
+
+	it("titles index lines from frontmatter description, then name, then the first line", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "desc", "---\nname: slug-with-description\ndescription: \"Summary from description\"\n---\nbody", "2026-09-09T00:00:00.000Z");
+			migrated(fx, "name", "---\nname: slug-only-name\n---\nbody", "2026-09-08T00:00:00.000Z");
+			add(fx, "plain", "first line of a fact\nsecond line", { kind: "fact", cwd: fx.root }, "2026-09-07T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("- Summary from description");
+			expect(context).not.toContain("slug-with-description");
+			expect(context).toContain("- slug-only-name");
+			expect(context).toContain("- first line of a fact");
+			expect(context).not.toContain("second line");
+		} finally { close(fx); }
+	});
+
+	it("renders task state in full ahead of the index", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "handoff", "HANDOFF BODY in full", { kind: "handoff", cwd: fx.root }, "2026-09-01T00:00:00.000Z");
+			migrated(fx, "migrated", "# Newer migrated memory", "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("HANDOFF BODY in full");
+			expect(context.indexOf("HANDOFF BODY in full")).toBeLessThan(context.indexOf("MEMORY INDEX"));
+		} finally { close(fx); }
+	});
+
+	it("counts index overflow instead of dropping titles silently", async () => {
+		const fx = fixture();
+		try {
+			const total = 300;
+			for (let i = 0; i < total; i++) {
+				migrated(fx, `m${String(i).padStart(3, "0")}`, `# Migrated memory number ${i}`, new Date(Date.UTC(2026, 8, 9) - i * 60_000).toISOString());
+			}
+			const context = await start(fx);
+			const shown = context.split("\n").filter(line => line.startsWith("- Migrated memory number ")).length;
+			const more = Number(/\+(\d+) more/.exec(context)?.[1] ?? "NaN");
+			expect(shown).toBeGreaterThan(0);
+			expect(shown + more).toBe(total);
+			expect(context.length).toBeLessThanOrEqual(6000);
+		} finally { close(fx); }
+	});
+
+	it("demotes a full row that does not fit to an index title", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "small", "small handoff that fits", { kind: "handoff", cwd: fx.root, task_key: "small" }, "2026-09-09T00:00:00.000Z");
+			add(fx, "huge", `Huge handoff title\n${"y".repeat(8000)}`, { kind: "handoff", cwd: fx.root, task_key: "huge" }, "2026-09-08T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("small handoff that fits");
+			expect(context).toContain("- Huge handoff title");
+			expect(context).not.toContain("yyyyyyyyyy");
+			expect(context).toContain("STARTUP ROWS LISTED BY TITLE ONLY: count=1");
+		} finally { close(fx); }
+	});
+
+	it("admits migrated memories on the SQL fallback path", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "migrated", "# Fallback migrated memory", "2026-09-09T00:00:00.000Z");
+			const output = await sessionStart(fx.root, {
+				context: fx.context,
+				now,
+				startupQueryExecutor: (db, sql, params, phase) => {
+					if (phase === "filtered") throw new Error("forced");
+					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
+				},
+			});
+			expect(output.hookSpecificOutput.additionalContext).toContain("- Fallback migrated memory");
+		} finally { close(fx); }
+	});
+
+	it("counts migrated memories outside the lookback window as omitted", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "old-migrated", "# Ancient migrated memory", "2024-01-01T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).not.toContain("Ancient migrated memory");
+			expect(context).toContain("STARTUP PROJECT ROWS OMITTED");
 		} finally { close(fx); }
 	});
 });
