@@ -13,13 +13,14 @@ const REVIEW_FAILURE_FILE = "review-failure.json";
 const REVIEW_RETRY_BASE_MS = 60_000;
 const REVIEW_RETRY_MAX_MS = 3_600_000;
 const STALE_DAYS = 30;
-// Startup context is a bounded bootstrap, not a historical export. Keep one
-// year of valid timestamped evidence while retaining NULL/malformed timestamps
-// for the existing JS parser to classify (or reject) conservatively.
+// Startup context is a bounded bootstrap, not a historical export. Project
+// rows need a timestamp SQLite can parse inside this window; global curated
+// rows keep NULL and unparseable timestamps and exclude only future ones.
 const STARTUP_LOOKBACK_DAYS = 365;
-// A fallback protects startup if a legacy SQLite build cannot evaluate the
-// JSON predicate. The normal path is filtered in SQLite and has no row cap;
-// this cap only applies when falling back to the compatibility query.
+// The filtered query has no row cap. If it fails, startup reruns the same
+// select list without its WHERE clause, capped here. Both need SQLite's JSON
+// functions, which Bun's SQLite always includes; without them startup reports
+// the store as unavailable rather than guessing.
 const SQL_FALLBACK_ROW_LIMIT = 4096;
 const CURATED_KINDS = new Set(["preference", "preferences", "correction", "identity"]);
 // Session episodes are not a project kind. A single episode can exceed the
@@ -372,7 +373,7 @@ function readBank(
 					rows.push(...result as RawRow[]);
 					const omitted = fallbackOmissionCount(db, table);
 					if (omitted > 0) notes.push(`STARTUP COMPATIBILITY ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; the filtered startup query failed and the ${SQL_FALLBACK_ROW_LIMIT}-row safety cap applied`);
-					diagnostics.push(`STARTUP SQL FILTER FALLBACK: bank=${bank} table=${table}; JS metadata filtering remained authoritative`);
+					diagnostics.push(`STARTUP SQL FILTER FALLBACK: bank=${bank} table=${table}; the filtered query failed, so admission ran on the same values without the SQL filter`);
 				}
 				const omitted = boundedProjectOmissionCount(db, table, columns, now, bank, globalBank);
 				if (omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
