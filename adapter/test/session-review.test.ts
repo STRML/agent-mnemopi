@@ -557,7 +557,8 @@ describe("SessionStart memory index", () => {
 			const full = lines.filter(line => line.startsWith("[bank=")).length;
 			const titled = lines.filter(line => line.startsWith("- ")).length;
 			const counted = Number(/^\+(\d+) more/m.exec(context)?.[1] ?? 0);
-			expect(full + titled + counted).toBe(40);
+			const truncated = Number(/TRUNCATED: (\d+) admitted rows?/.exec(context)?.[1] ?? 0);
+			expect(full + titled + counted + truncated).toBe(40);
 			expect(context.length).toBeLessThanOrEqual(6000);
 		} finally { close(fx); }
 	});
@@ -575,6 +576,50 @@ describe("SessionStart memory index", () => {
 			expect(context).toContain("- unterminated-name");
 			expect(context).toContain("- Folded description continues here");
 			expect(context).toContain("- Literal first line second line");
+		} finally { close(fx); }
+	});
+
+	it("accounts for an index row even when the header nearly fills a tiny budget", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "lone-fact", "the lone project fact", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now, maxChars: 256 })).hookSpecificOutput.additionalContext;
+			const titled = context.split("\n").filter(line => line.startsWith("- ")).length;
+			const counted = Number(/^\+(\d+) more/m.exec(context)?.[1] ?? 0);
+			const truncated = Number(/TRUNCATED: (\d+) admitted rows?/.exec(context)?.[1] ?? 0);
+			expect(titled + counted + truncated).toBe(1);
+			expect(context.length).toBeLessThanOrEqual(256);
+		} finally { close(fx); }
+	});
+
+	it("gives an unused index reserve back to full rows", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "big", `BIGROW-${"x".repeat(5490)}-END`, { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			add(fx, "small-fact", "short fact", { kind: "fact", cwd: fx.root }, "2026-09-08T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("-END");
+			expect(context).toContain("- short fact");
+		} finally { close(fx); }
+	});
+
+	it("keeps tier order when a higher-tier row is too large to show in full", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "big-rule", `CURATED-RULE ${"y".repeat(7000)}`, { kind: "preference" }, "2026-09-09T00:00:00.000Z");
+			add(fx, "task-row", "TASK-STATE-ROW small handoff", { kind: "handoff", cwd: fx.root }, "2026-09-08T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context.indexOf("CURATED-RULE")).toBeGreaterThanOrEqual(0);
+			expect(context.indexOf("CURATED-RULE")).toBeLessThan(context.indexOf("TASK-STATE-ROW"));
+		} finally { close(fx); }
+	});
+
+	it("reads an indented --- inside a literal block scalar as text", async () => {
+		const fx = fixture();
+		try {
+			migrated(fx, "fenced", "---\ndescription: |\n  first part\n  ---\n  after rule\n---\nbody", "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("- first part --- after rule");
 		} finally { close(fx); }
 	});
 
