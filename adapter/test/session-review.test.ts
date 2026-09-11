@@ -623,6 +623,33 @@ describe("SessionStart memory index", () => {
 		} finally { close(fx); }
 	});
 
+	it("keeps memory rows when stale-handoff notes flood the budget", async () => {
+		const fx = fixture();
+		try {
+			const metadata = { kind: "handoff", cwd: fx.root, task_key: "busy" };
+			fx.db.exec("BEGIN");
+			for (let i = 0; i < 1500; i++) add(fx, `old-${i}`, `stale handoff ${i}`, metadata, new Date(Date.UTC(2026, 8, 1) + i * 60_000).toISOString());
+			fx.db.exec("COMMIT");
+			add(fx, "current", "CURRENT-HANDOFF body", metadata, "2026-09-09T00:00:00.000Z");
+			const context = await start(fx);
+			expect(context).toContain("CURRENT-HANDOFF");
+			expect(context.length).toBeLessThanOrEqual(6000);
+		} finally { close(fx); }
+	});
+
+	it("shows every title when the heading and titles fit exactly", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "only-fact", "the only project fact, with enough words to be long", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const run = async (maxChars?: number): Promise<string> => (await sessionStart(fx.root, { context: fx.context, now, ...(maxChars ? { maxChars } : {}) })).hookSpecificOutput.additionalContext;
+			await run(); // the first run sweeps the review, which changes the header
+			const roomy = await run();
+			expect(roomy).toContain("- the only project fact");
+			expect(roomy.length).toBeGreaterThan(256);
+			expect(await run(roomy.length)).toBe(roomy);
+		} finally { close(fx); }
+	});
+
 	it("counts migrated memories outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {
