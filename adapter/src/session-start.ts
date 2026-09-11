@@ -179,15 +179,15 @@ function admission(row: RawRow, bank: string, globalBank: string, projectRoot: s
 	const taskKey = text(metadata.task_key || metadata.taskKey).trim();
 	const decided = (verdict: Verdict): Admission => ({ verdict, metadata, kind, taskKey });
 	if (text(row.superseded_by).trim()) return decided("reject");
-	// A table without a timestamp column applies no time rules at all.
-	const timed = "timestamp" in row;
+	// A missing timestamp, including a table with no timestamp column, reads as
+	// "": global rows keep it, and project rows fail the window and are counted.
 	const timestamp = text(row.timestamp);
 	const global = bank === globalBank || metadata.global === true;
-	if (global && CURATED_KINDS.has(kind) && (!timed || notFuture(timestamp, now))) return decided("admit");
+	if (global && CURATED_KINDS.has(kind) && notFuture(timestamp, now)) return decided("admit");
 	const cwd = text(metadata.cwd);
 	const projectMatch = cwd.length > 0 && path.resolve(cwd) === projectRoot;
 	if (!projectMatch || !(PROJECT_KINDS.has(kind) || taskKey.length > 0)) return decided("reject");
-	return decided(!timed || withinLookback(timestamp, now) ? "admit" : "omit_window");
+	return decided(withinLookback(timestamp, now) ? "admit" : "omit_window");
 }
 
 /** Build the startup row from phase-1 decision columns merged with phase-2 detail columns. */
@@ -265,14 +265,19 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 		if (mismatch) return { bank, dbPath, rows: [], error: mismatch };
 		const db = new Database(dbPath, { readonly: true });
 		try {
-			const rows: StartupMemory[] = [];
-			const notes: string[] = [];
-			for (const table of ["working_memory", "episodic_memory"] as const) {
-				const read = readTable(db, table, bank, globalBank, projectRoot, now);
-				rows.push(...read.rows);
-				if (read.omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${read.omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
-			}
-			return { bank, dbPath, rows, ...(notes.length > 0 ? { notes } : {}) };
+			// One read transaction gives both phases, and both tables, the same
+			// snapshot, so a concurrent writer cannot pair new content with a
+			// decision made on the old row.
+			return db.transaction((): BankRead => {
+				const rows: StartupMemory[] = [];
+				const notes: string[] = [];
+				for (const table of ["working_memory", "episodic_memory"] as const) {
+					const read = readTable(db, table, bank, globalBank, projectRoot, now);
+					rows.push(...read.rows);
+					if (read.omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${read.omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
+				}
+				return { bank, dbPath, rows, ...(notes.length > 0 ? { notes } : {}) };
+			})();
 		} finally {
 			db.close();
 		}

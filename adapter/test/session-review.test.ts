@@ -145,7 +145,7 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("keeps session episodes out of startup", async () => {
+	it("keeps session episodes without a task key out of startup", async () => {
 		const fx = fixture();
 		try {
 			// One episode can exceed the whole startup budget. Admitting them would
@@ -266,7 +266,7 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("never counts an empty-looking task_key as task state", async () => {
+	it("does not count an empty-array or blank-string task_key as task state", async () => {
 		const fx = fixture();
 		try {
 			// A task_key admits a row of any kind in full, so a junk value must not let an episode in.
@@ -279,6 +279,24 @@ describe("SessionStart bounded metadata recall", () => {
 			expect(context).not.toContain("episode with an empty array task key");
 			expect(context).not.toContain("episode with a blank array task key");
 			expect(context).not.toContain("episode with a non-breaking-space task key");
+		} finally { close(fx); }
+	});
+
+	it("treats a table without a timestamp column as undated", async () => {
+		const fx = fixture();
+		try {
+			fx.db.exec(`
+				DROP TABLE working_memory; DROP TABLE episodic_memory;
+				CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, metadata_json TEXT, memory_type TEXT);
+				CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, metadata_json TEXT);
+			`);
+			const insert = "INSERT INTO working_memory (id, content, metadata_json, memory_type) VALUES (?, ?, ?, ?)";
+			fx.db.run(insert, ["pref", "undated global preference", JSON.stringify({ kind: "preference" }), "preference"]);
+			fx.db.run(insert, ["fact", "undated project fact", JSON.stringify({ kind: "fact", cwd: fx.root }), "fact"]);
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("undated global preference");
+			expect(context).not.toContain("undated project fact");
+			expect(context).toContain("STARTUP PROJECT ROWS OMITTED");
 		} finally { close(fx); }
 	});
 
