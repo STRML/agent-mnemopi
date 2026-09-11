@@ -161,7 +161,7 @@ describe("SessionStart bounded metadata recall", () => {
 	it("admits a fact whose metadata kind is a falsy non-string", async () => {
 		const fx = fixture();
 		try {
-			// JS falls back from a falsy kind to memory_type; the SQL prefilter must too.
+			// A falsy kind falls back to memory_type, the way JSON.parse and || read it.
 			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["false-kind", "fact stored with kind false", "test", "2026-09-10T00:00:00.000Z", JSON.stringify({ kind: false, cwd: fx.root }), "fact"]);
 			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
 			expect(context).toContain("fact stored with kind false");

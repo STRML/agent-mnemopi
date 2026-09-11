@@ -247,9 +247,9 @@ function readTable(db: Database, table: string, bank: string, globalBank: string
 		const decision = admission(row, bank, globalBank, projectRoot, now);
 		if (decision.verdict === "omit_window") omitted += 1;
 		if (decision.verdict !== "admit") continue;
-		// A concurrent writer can delete the row between the two reads.
-		const found = detail.get(row.id as never) as RawRow | null;
-		const memory = found ? toStartupMemory({ ...row, ...found }, decision, bank, now) : null;
+		// Inside the read snapshot every phase-1 row is still present in phase 2; a
+		// missing one would carry no content, which toStartupMemory rejects.
+		const memory = toStartupMemory({ ...row, ...(detail.get(row.id as never) as RawRow | null) }, decision, bank, now);
 		if (memory) rows.push(memory);
 	}
 	return { rows, omitted };
@@ -501,9 +501,8 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 		if (options.recall && !read.error) {
 			try {
 				const recalled = callbackRows(await options.recall(bank, context), bank, now);
-				// Packet A owns the evidence policy. Without its selector, callback
-				// results are deliberately not injected; direct SQL below remains
-				// metadata-qualified and deterministic.
+				// Packet A's selector owns the evidence policy for recalled rows; the
+				// direct store read above stays metadata-qualified and deterministic.
 				const selector = options.selectInjectableRecall ?? policySelectInjectableRecall;
 				if (selector) {
 					const selected = selector(projectRoot, recalled as unknown as RecallCandidate[]);
