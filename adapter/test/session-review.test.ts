@@ -135,6 +135,39 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("injects project facts through the SQL prefilter", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "project-fact", "project fact about the repo", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("project fact about the repo");
+			expect(context).toContain("kind=fact");
+		} finally { close(fx); }
+	});
+
+	it("keeps session episodes out of startup so they cannot evict task state", async () => {
+		const fx = fixture();
+		try {
+			// One episode can exceed the whole startup budget. Admitting them would
+			// push handoffs and status rows past the truncation point.
+			add(fx, "project-episode", "project session episode transcript", { kind: "episode", cwd: fx.root }, "2026-09-10T00:00:00.000Z");
+			add(fx, "project-handoff", "project handoff that must survive", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("project handoff that must survive");
+			expect(context).not.toContain("project session episode transcript");
+		} finally { close(fx); }
+	});
+
+	it("counts project facts outside the lookback window as omitted", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "old-fact", "project fact from two years ago", { kind: "fact", cwd: fx.root }, "2024-01-01T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).not.toContain("project fact from two years ago");
+			expect(context).toContain("STARTUP PROJECT ROWS OMITTED");
+		} finally { close(fx); }
+	});
+
 	it("keeps valid memory-type rows when metadata is malformed", async () => {
 		const fx = fixture();
 		try {

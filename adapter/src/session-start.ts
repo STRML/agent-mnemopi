@@ -22,7 +22,16 @@ const STARTUP_LOOKBACK_DAYS = 365;
 // this cap only applies when falling back to the compatibility query.
 const SQL_FALLBACK_ROW_LIMIT = 4096;
 const CURATED_KINDS = new Set(["preference", "preferences", "correction", "identity"]);
-const PROJECT_KINDS = new Set(["handoff", "project_handoff", "note", "project_note", "relevant"]);
+// Session episodes are not a project kind. A single episode can exceed the
+// whole startup budget and would push handoffs and status rows past the
+// truncation point; they stay reachable through query-time recall. A row of
+// any kind still qualifies through task_key, and no episode writer sets one.
+const PROJECT_KINDS = new Set(["handoff", "project_handoff", "note", "project_note", "relevant", "fact"]);
+
+/** Render a kind set as a SQL IN-list so the prefilter cannot drift from the JS curation sets. */
+function sqlKindList(kinds: ReadonlySet<string>): string {
+	return [...kinds].map(kind => `'${kind.replace(/'/g, "''")}'`).join(", ");
+}
 
 export interface StartupMemory {
 	readonly id: string;
@@ -218,8 +227,8 @@ function startupQuery(
 	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
 	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
 	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
-	const globalKind = `${kind} IN ('preference', 'preferences', 'correction', 'identity')`;
-	const projectKind = `${kind} IN ('handoff', 'project_handoff', 'note', 'project_note', 'relevant') OR ${taskKey} <> ''`;
+	const globalKind = `${kind} IN (${sqlKindList(CURATED_KINDS)})`;
+	const projectKind = `${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''`;
 	const globalScope = bank === globalBank ? "1 = 1" : `${json("$.global")} = 1`;
 	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
 	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
@@ -273,7 +282,7 @@ function boundedProjectOmissionCount(db: Database, table: string, columns: Set<s
 	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
 	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
 	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
-	const projectKind = `${kind} IN ('handoff', 'project_handoff', 'note', 'project_note', 'relevant') OR ${taskKey} <> ''`;
+	const projectKind = `${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''`;
 	const projectScope = `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${projectKind}))`;
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const conditions = [
