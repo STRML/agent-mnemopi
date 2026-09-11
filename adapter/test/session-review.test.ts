@@ -689,6 +689,22 @@ describe("SessionStart memory index", () => {
 		} finally { close(fx); }
 	});
 
+	it("drops diagnostics that carry no rows before the contentless count", async () => {
+		const fx = fixture();
+		try {
+			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["blank", "", "test", "2026-09-09T00:00:00.000Z", JSON.stringify({ kind: "handoff", cwd: fx.root }), "handoff"]);
+			add(fx, "real", "a handoff with content", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const run = async (maxChars?: number): Promise<string> => (await sessionStart(fx.root, { context: fx.context, now, ...(maxChars ? { maxChars } : {}) })).hookSpecificOutput.additionalContext;
+			await run(); // the first run sweeps the review, which changes the header
+			const roomy = await run();
+			expect(roomy).toContain("STARTUP ROWS WITHOUT CONTENT");
+			expect(roomy).toContain("REVIEW STATUS");
+			const tight = await run(roomy.length - 20);
+			expect(tight).toContain("STARTUP ROWS WITHOUT CONTENT");
+			expect(tight).not.toContain("REVIEW STATUS");
+		} finally { close(fx); }
+	});
+
 	it("counts migrated memories outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {

@@ -496,11 +496,13 @@ function fitLines(lines: readonly OutputLine[], maxChars: number): string {
 	let total = lines.reduce((sum, line) => sum + line.text.length + 1, 0) - 1;
 	if (total <= maxChars) return join(lines);
 	const entries = lines.map(line => ({ line, dropped: false }));
-	// Notes are diagnostics and memory rows are the point, so notes go first, newest
-	// note last. Dropping by index keeps this linear in the number of lines.
+	// Diagnostics that stand for nothing go first, then memory rows from the end, and
+	// a diagnostic that carries admitted rows goes last. Dropping by index keeps this
+	// linear in the number of lines.
 	const order = [
-		...entries.filter(entry => entry.line.note).reverse(),
+		...entries.filter(entry => entry.line.note && entry.line.rows === 0).reverse(),
 		...entries.filter(entry => !entry.line.note && !entry.line.keep).reverse(),
+		...entries.filter(entry => entry.line.note && entry.line.rows > 0).reverse(),
 	];
 	let rows = 0;
 	let notes = 0;
