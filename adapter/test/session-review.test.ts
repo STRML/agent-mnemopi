@@ -135,7 +135,7 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("injects project facts through the SQL prefilter", async () => {
+	it("injects project facts that match the project", async () => {
 		const fx = fixture();
 		try {
 			add(fx, "project-fact", "project fact about the repo", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.000Z");
