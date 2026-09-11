@@ -212,6 +212,42 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("makes the same timestamp decisions on the filtered and fallback paths", async () => {
+		const forceFallback = (db: Database, sql: string, params: readonly unknown[], phase: "filtered" | "fallback"): Array<Record<string, unknown>> => {
+			if (phase === "filtered") throw new Error("forced");
+			return db.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
+		};
+		const run = async (fallback: boolean): Promise<string> => {
+			const fx = fixture();
+			try {
+				// SQLite reads RFC 2822 as unparseable and a doubled T as a real date; JS disagrees on both.
+				add(fx, "rfc", "project fact with an RFC 2822 timestamp", { kind: "fact", cwd: fx.root }, "Wed, 09 Sep 2026 00:00:00 GMT");
+				add(fx, "double-t", "global preference with a doubled T", { kind: "preference" }, "2027-01-01TT00:00:00");
+				add(fx, "control", "project fact with an ISO timestamp", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+				const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), ...(fallback ? { startupQueryExecutor: forceFallback } : {}) });
+				return output.hookSpecificOutput.additionalContext;
+			} finally { close(fx); }
+		};
+		const filtered = await run(false);
+		const fallback = await run(true);
+		for (const marker of ["project fact with an RFC 2822 timestamp", "global preference with a doubled T", "project fact with an ISO timestamp"]) {
+			expect(fallback.includes(marker)).toBe(filtered.includes(marker));
+		}
+		expect(filtered).toContain("project fact with an ISO timestamp");
+		expect(filtered).not.toContain("project fact with an RFC 2822 timestamp");
+		expect(filtered).not.toContain("global preference with a doubled T");
+	});
+
+	it("counts a future global row that matches the project as omitted", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "future-global", "future global preference with a task key", { kind: "preference", cwd: fx.root, task_key: "tracked" }, "2026-09-11T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).not.toContain("future global preference with a task key");
+			expect(context).toContain("STARTUP PROJECT ROWS OMITTED");
+		} finally { close(fx); }
+	});
+
 	it("counts project facts outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {

@@ -152,16 +152,19 @@ function isExpired(validUntil: string, now: Date): boolean {
 	return Number.isFinite(parsed) && parsed <= now.getTime();
 }
 
-/** JS mirror of the SQL project window, so the fallback path cannot admit what the filtered path excludes. */
-function withinLookback(timestamp: string, now: Date): boolean {
-	const parsed = Date.parse(timestamp);
-	return Number.isFinite(parsed) && parsed >= now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000 && parsed <= now.getTime();
+/** SQLite datetime() text for a Date. JS compares these strings exactly as the SQL compares datetime() output. */
+function sqliteTime(date: Date): string {
+	return date.toISOString().slice(0, 19).replace("T", " ");
 }
 
-/** JS mirror of the SQL global rule: keep old and unparseable timestamps, never future ones. */
-function notFuture(timestamp: string, now: Date): boolean {
-	const parsed = Date.parse(timestamp);
-	return !Number.isFinite(parsed) || parsed <= now.getTime();
+/** The project window over SQLite's own parse of the timestamp; null means SQLite could not parse it. */
+function withinLookback(parsed: string | null, now: Date): boolean {
+	return parsed !== null && parsed >= sqliteTime(new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000)) && parsed <= sqliteTime(now);
+}
+
+/** The global rule over SQLite's parse: keep old and unparseable timestamps, never future ones. */
+function notFuture(parsed: string | null, now: Date): boolean {
+	return parsed === null || parsed <= sqliteTime(now);
 }
 
 function kindOf(metadata: Record<string, unknown>, row: RawRow): string {
@@ -180,10 +183,12 @@ function rowToMemory(row: RawRow, bank: string, globalBank: string, projectRoot:
 	const kind = kindOf(metadata, row);
 	const global = bank === globalBank || Boolean(metadata.global === true);
 	const projectMatch = cwd.length > 0 && path.resolve(cwd) === projectRoot;
-	// Mirror the SQL time predicates so the fallback path admits the same rows.
-	const timed = "timestamp" in row;
-	const globalAdmit = global && CURATED_KINDS.has(kind) && (!timed || notFuture(timestamp ?? "", now));
-	const projectAdmit = projectMatch && (PROJECT_KINDS.has(kind) || taskKey.length > 0) && (!timed || withinLookback(timestamp ?? "", now));
+	// Both queries select SQLite's own parse as startup_ts, so the time rules here
+	// see exactly what the SQL predicates saw, on the filtered and fallback paths.
+	const timed = "startup_ts" in row;
+	const startupTs = typeof row.startup_ts === "string" ? row.startup_ts : null;
+	const globalAdmit = global && CURATED_KINDS.has(kind) && (!timed || notFuture(startupTs, now));
+	const projectAdmit = projectMatch && (PROJECT_KINDS.has(kind) || taskKey.length > 0) && (!timed || withinLookback(startupTs, now));
 	if (!globalAdmit && !projectAdmit) return null;
 	if (text(row.superseded_by).trim()) return null;
 	return {
@@ -221,6 +226,17 @@ function tableColumns(db: Database, table: string): Set<string> {
 			.map(row => text(row.name))
 			.filter(Boolean),
 	);
+}
+
+// Global curated preferences, corrections, and identities are durable policy:
+// keep old and unparseable timestamps, never future ones (param: now). Project
+// rows stay inside the startup lookback window (params: cutoff, now).
+const GLOBAL_TIME_SQL = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
+const PROJECT_TIME_SQL = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
+
+/** Every column, plus SQLite's own parse of the timestamp for the JS time rules. */
+function startupColumns(columns: Set<string>): string {
+	return columns.has("timestamp") ? "*, datetime(timestamp) AS startup_ts" : "*";
 }
 
 // Use guarded JSON extraction so one malformed metadata blob cannot turn a
@@ -265,19 +281,14 @@ function startupQuery(
 	const params: unknown[] = [];
 	let conditions: string[];
 	if (columns.has("timestamp")) {
-		// Global curated preferences/corrections/identities are durable policy;
-		// retain old and malformed-timestamp rows, but never admit future rows.
-		// Project-scoped rows remain bounded to the startup lookback window.
-		const globalTime = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
-		const projectTime = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
-		conditions = [`((${globalScope} AND ${globalTime}) OR (${projectScope} AND ${projectTime}))`];
+		conditions = [`((${globalScope} AND ${GLOBAL_TIME_SQL}) OR (${projectScope} AND ${PROJECT_TIME_SQL}))`];
 		params.push(now.toISOString(), cutoff, now.toISOString());
 	} else {
 		conditions = [`(${globalScope} OR ${projectScope})`];
 	}
 	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	return { sql: `SELECT * FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
+	return { sql: `SELECT ${startupColumns(columns)} FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order}`, params };
 }
 
 function fallbackQuery(table: string, columns: Set<string>): { sql: string; params: unknown[] } {
@@ -286,7 +297,7 @@ function fallbackQuery(table: string, columns: Set<string>): { sql: string; para
 	// rowToMemory still applies the same JS curation rules. This path is rare,
 	// and the diagnostic makes its conservative loss visible to the host.
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	return { sql: `SELECT * FROM ${table} ORDER BY ${order} LIMIT ?`, params: [SQL_FALLBACK_ROW_LIMIT] };
+	return { sql: `SELECT ${startupColumns(columns)} FROM ${table} ORDER BY ${order} LIMIT ?`, params: [SQL_FALLBACK_ROW_LIMIT] };
 }
 
 function fallbackOmissionCount(db: Database, table: string): number {
@@ -305,13 +316,13 @@ function boundedProjectOmissionCount(db: Database, table: string, columns: Set<s
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const conditions = [
 		projectScope,
-		// A global curated row is admitted on its own rule, so its age is not a project omission.
-		`NOT ${globalScope}`,
+		// A global curated row its own rule admits is not a project omission; a future one is.
+		`NOT (${globalScope} AND ${GLOBAL_TIME_SQL})`,
 		"(datetime(timestamp) IS NULL OR datetime(timestamp) < datetime(?) OR datetime(timestamp) > datetime(?))",
 	];
 	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
 	try {
-		const result = db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${conditions.join(" AND ")}`).get(cutoff, now.toISOString()) as { count?: unknown } | null;
+		const result = db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${conditions.join(" AND ")}`).get(now.toISOString(), cutoff, now.toISOString()) as { count?: unknown } | null;
 		const count = Number(result?.count ?? 0);
 		return Number.isFinite(count) ? count : 0;
 	} catch {
