@@ -131,7 +131,21 @@ function parseMetadata(value: unknown): Record<string, unknown> {
 }
 
 function text(value: unknown): string {
-	return typeof value === "string" ? value : value == null ? "" : String(value);
+	if (typeof value === "string") return value;
+	if (value == null) return "";
+	// String() calls toString, and JSON can supply one that is not a function; one
+	// such row must not throw and take the whole bank down with it.
+	try {
+		return String(value);
+	} catch {
+		return "";
+	}
+}
+
+/** A row's time for ordering, parsed as the time rules parse it; unparseable sorts oldest. */
+function rowTime(row: StartupMemory): number {
+	const parsed = Date.parse(row.timestamp ?? "");
+	return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 }
 
 function ageDays(timestamp: string, now: Date): number | null {
@@ -238,8 +252,8 @@ function tableColumns(db: Database, table: string): Set<string> {
 function readTable(db: Database, table: string, bank: string, globalBank: string, projectRoot: string, now: Date): { rows: StartupMemory[]; omitted: number } {
 	const columns = tableColumns(db, table);
 	const pick = (names: readonly string[]): string => names.filter(name => columns.has(name)).join(", ");
-	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
-	const candidates = db.query(`SELECT ${pick(DECISION_COLUMNS)} FROM ${table} ORDER BY ${order}`).all() as RawRow[];
+	// Ordered by id only: startup sorts by parsed time in JS, so SQL never interprets a timestamp.
+	const candidates = db.query(`SELECT ${pick(DECISION_COLUMNS)} FROM ${table} ORDER BY id`).all() as RawRow[];
 	const detail = db.query(`SELECT ${pick(DETAIL_COLUMNS)} FROM ${table} WHERE id = ?`);
 	const rows: StartupMemory[] = [];
 	let omitted = 0;
@@ -321,14 +335,14 @@ function dedupeAndCurate(rows: readonly StartupMemory[]): { rows: StartupMemory[
 	const byId = new Map<string, StartupMemory>();
 	for (const row of rows) {
 		const previous = byId.get(row.id);
-		if (!previous || (row.timestamp ?? "") > (previous.timestamp ?? "")) byId.set(row.id, row);
+		if (!previous || rowTime(row) > rowTime(previous)) byId.set(row.id, row);
 	}
 	const byTask = new Map<string, StartupMemory>();
 	const staleNotes: string[] = [];
 	for (const row of byId.values()) {
 		if (!row.taskKey) continue;
 		const previous = byTask.get(row.taskKey);
-		if (!previous || (row.timestamp ?? "") > (previous.timestamp ?? "")) byTask.set(row.taskKey, row);
+		if (!previous || rowTime(row) > rowTime(previous)) byTask.set(row.taskKey, row);
 	}
 	const selected = [...byId.values()].filter(row => {
 		if (!row.taskKey) return true;
@@ -337,7 +351,7 @@ function dedupeAndCurate(rows: readonly StartupMemory[]): { rows: StartupMemory[
 		staleNotes.push(`STALE HANDOFF OMITTED: task_key=${row.taskKey} id=${row.id}; newest=${newest?.id ?? "unknown"}`);
 		return false;
 	});
-	selected.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? "") || a.id.localeCompare(b.id));
+	selected.sort((a, b) => Math.sign(rowTime(b) - rowTime(a) || 0) || a.id.localeCompare(b.id));
 	return { rows: selected, notes: staleNotes };
 }
 

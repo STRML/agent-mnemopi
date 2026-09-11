@@ -300,6 +300,45 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("keeps the bank when a row's metadata cannot be turned into text", async () => {
+		const fx = fixture();
+		try {
+			const root = JSON.stringify(fx.root);
+			const raw = "INSERT INTO working_memory (id, content, source, timestamp, metadata_json) VALUES (?, ?, ?, ?, ?)";
+			// JSON can supply toString as a string, which makes String() throw.
+			fx.db.run(raw, ["empty-bad", "", "test", "2026-09-09T00:00:00.000Z", `{"kind":{"toString":"x"},"cwd":${root}}`]);
+			fx.db.run(raw, ["full-bad", "content with an unprintable kind", "test", "2026-09-09T00:00:00.000Z", `{"kind":{"toString":"x"},"cwd":${root}}`]);
+			add(fx, "good", "a readable project fact", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") });
+			expect(output.hookSpecificOutput.additionalContext).toContain("a readable project fact");
+			expect(output.systemMessage ?? "").not.toContain("store_unavailable");
+		} finally { close(fx); }
+	});
+
+	it("chooses the newest handoff for a task key across timestamp formats", async () => {
+		const fx = fixture();
+		try {
+			const metadata = { kind: "handoff", cwd: fx.root, task_key: "mixed" };
+			add(fx, "older-rfc", "older handoff dated in RFC 2822", metadata, "Wed, 09 Sep 2026 00:00:00 GMT");
+			add(fx, "newer-iso", "newer handoff dated in ISO", metadata, "2026-09-10T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T12:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("newer handoff dated in ISO");
+			expect(context).not.toContain("older handoff dated in RFC 2822");
+			expect(context).toContain("STALE HANDOFF OMITTED: task_key=mixed id=older-rfc");
+		} finally { close(fx); }
+	});
+
+	it("orders startup rows by time across timestamp formats", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "older-rfc", "OLDER-RFC fact", { kind: "fact", cwd: fx.root }, "Mon, 07 Sep 2026 00:00:00 GMT");
+			add(fx, "newer-iso", "NEWER-ISO fact", { kind: "fact", cwd: fx.root }, "2026-09-08T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context.indexOf("NEWER-ISO")).toBeGreaterThanOrEqual(0);
+			expect(context.indexOf("NEWER-ISO")).toBeLessThan(context.indexOf("OLDER-RFC"));
+		} finally { close(fx); }
+	});
+
 	it("counts project facts outside the lookback window as omitted", async () => {
 		const fx = fixture();
 		try {
