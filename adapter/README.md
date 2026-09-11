@@ -46,18 +46,14 @@ bounded and labels stale or omitted notes; it does not write the OMP database.
 Each startup checks the weekly review schedule and, when due, runs a bounded
 read-only review automatically. A private full-text snapshot is published only
 after successful completion; the explicit `review` command remains available.
-Review does not prune or repair memories. Startup pushes its metadata and
-timestamp filters into SQLite, keeps a one-year timestamp window for
-project-scoped rows while retaining durable global preferences, corrections,
-and identities, and records bounded project omissions plus failed review
-attempts with bounded exponential retry backoff. Every admission input
-is computed once in SQLite and selected as a `startup_*` column that
-rowToMemory decides on; JS adds only the `path.resolve` comparison on cwd. So
-the capped fallback (the filtered query without its WHERE clause) makes the
-same decision for every row it returns, and rows past its 4096-row cap are
-counted and reported. The fallback is visible in the hook
-diagnostics, and callback selection uses the
-concrete project path.
+Review does not prune or repair memories. Startup reads in two phases: the
+decision columns of every row, then content only for the rows it admits.
+Admission is decided in JS by parsing metadata with JSON.parse, so metadata has
+one reading. Startup keeps a one-year timestamp window for project-scoped rows,
+keeps durable global preferences, corrections, and identities regardless of
+age (excluding only future-dated ones), reports project rows it omits for the
+window, and backs off failed review sweeps with bounded exponential retry.
+Callback selection uses the concrete project path.
 
 `context` is read-only and resolves OMP global/project settings, the native
 bank scope, exact DB path, and the OMP embedding model. `mcp` and `call` set

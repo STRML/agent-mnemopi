@@ -46,18 +46,15 @@ database. It bounds injected context and reports omitted or stale notes. A due
 review runs automatically at startup on its weekly schedule by default. It is
 read-only, does not prune or repair memories, and publishes a private full-text
 snapshot only after successful completion; the explicit `review` command is also
-available. Startup filters curated rows in SQLite before loading them, keeps a
-one-year timestamp window for project-scoped rows (while retaining durable
-global preferences, corrections, and identities plus null or malformed
-timestamps for safe classification), and backs off failed review sweeps from
-one minute up to one hour instead of retrying every session. If a bounded
-project sweep omits rows, startup reports the omission in its untrusted
-context diagnostics. Admission inputs are computed once, in SQLite, so
-if the filtered query fails, the capped fallback that reruns it without its
-filter makes the same admission decision for every row it returns and
-reports that degraded path visibly; callback
-recall is selected against the concrete project path rather than synthetic
-startup wording.
+available. Startup reads each row's decision columns, decides admission in JS by parsing
+metadata with JSON.parse, and then reads content only for admitted rows. It
+keeps a one-year timestamp window for project-scoped rows, keeps durable global
+preferences, corrections, and identities regardless of age (excluding only
+future-dated ones), and backs off failed review sweeps from one minute up to
+one hour instead of retrying every session. If project rows fall outside the
+window or carry an unparseable timestamp, startup reports the count in its
+untrusted context diagnostics; callback recall is selected against the
+concrete project path rather than synthetic startup wording.
 
 The installer is opt-in and never grants blanket hook trust:
 

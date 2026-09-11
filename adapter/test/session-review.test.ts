@@ -178,23 +178,14 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("applies the same time rules on the SQL fallback path", async () => {
+	it("applies the time rules to facts, handoffs, and global rows", async () => {
 		const fx = fixture();
 		try {
 			add(fx, "fresh-fact", "fresh project fact", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
 			add(fx, "old-fact", "project fact from two years ago", { kind: "fact", cwd: fx.root }, "2024-01-01T00:00:00.000Z");
 			add(fx, "old-handoff", "project handoff from two years ago", { kind: "handoff", cwd: fx.root }, "2024-01-01T00:00:00.000Z");
 			add(fx, "future-pref", "preference dated in the future", { kind: "preference" }, "2026-09-11T00:00:00.000Z");
-			const output = await sessionStart(fx.root, {
-				context: fx.context,
-				now: new Date("2026-09-10T00:00:00.000Z"),
-				startupQueryExecutor: (db, sql, params, phase) => {
-					if (phase === "filtered") throw new Error("forced");
-					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
-				},
-			});
-			const context = output.hookSpecificOutput.additionalContext;
-			expect(context).toContain("STARTUP SQL FILTER FALLBACK");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
 			expect(context).toContain("fresh project fact");
 			expect(context).not.toContain("project fact from two years ago");
 			expect(context).not.toContain("project handoff from two years ago");
@@ -212,35 +203,21 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("makes the same timestamp decisions on the filtered and fallback paths", async () => {
-		const forceFallback = (db: Database, sql: string, params: readonly unknown[], phase: "filtered" | "fallback"): Array<Record<string, unknown>> => {
-			if (phase === "filtered") throw new Error("forced");
-			return db.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
-		};
-		const run = async (fallback: boolean): Promise<string> => {
-			const fx = fixture();
-			try {
-				// SQLite reads RFC 2822 as unparseable and a doubled T as a real date; JS disagrees on both.
-				add(fx, "rfc", "project fact with an RFC 2822 timestamp", { kind: "fact", cwd: fx.root }, "Wed, 09 Sep 2026 00:00:00 GMT");
-				add(fx, "double-t", "global preference with a doubled T", { kind: "preference" }, "2027-01-01TT00:00:00");
-				add(fx, "control", "project fact with an ISO timestamp", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
-				// Half a second ahead of now: a whole-second comparison would call these "now".
-				add(fx, "sub-second-global", "global preference half a second ahead", { kind: "preference" }, "2026-09-10T00:00:00.500Z");
-				add(fx, "sub-second-project", "project fact half a second ahead", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.500Z");
-				const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), ...(fallback ? { startupQueryExecutor: forceFallback } : {}) });
-				return output.hookSpecificOutput.additionalContext;
-			} finally { close(fx); }
-		};
-		const filtered = await run(false);
-		const fallback = await run(true);
-		for (const marker of ["project fact with an RFC 2822 timestamp", "global preference with a doubled T", "project fact with an ISO timestamp", "global preference half a second ahead", "project fact half a second ahead"]) {
-			expect(fallback.includes(marker)).toBe(filtered.includes(marker));
-		}
-		expect(filtered).toContain("project fact with an ISO timestamp");
-		expect(filtered).not.toContain("project fact with an RFC 2822 timestamp");
-		expect(filtered).not.toContain("global preference with a doubled T");
-		expect(filtered).not.toContain("global preference half a second ahead");
-		expect(filtered).not.toContain("project fact half a second ahead");
+	it("reads timestamps with one parser, to the millisecond", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "rfc", "project fact with an RFC 2822 timestamp", { kind: "fact", cwd: fx.root }, "Wed, 09 Sep 2026 00:00:00 GMT");
+			add(fx, "garbage-project", "project fact with an unparseable timestamp", { kind: "fact", cwd: fx.root }, "2027-01-01TT00:00:00");
+			add(fx, "garbage-global", "global preference with an unparseable timestamp", { kind: "preference" }, "2027-01-01TT00:00:00");
+			add(fx, "sub-second-global", "global preference half a second ahead", { kind: "preference" }, "2026-09-10T00:00:00.500Z");
+			add(fx, "sub-second-project", "project fact half a second ahead", { kind: "fact", cwd: fx.root }, "2026-09-10T00:00:00.500Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("project fact with an RFC 2822 timestamp");
+			expect(context).not.toContain("project fact with an unparseable timestamp");
+			expect(context).toContain("global preference with an unparseable timestamp");
+			expect(context).not.toContain("global preference half a second ahead");
+			expect(context).not.toContain("project fact half a second ahead");
+		} finally { close(fx); }
 	});
 
 	it("counts a future global row that matches the project as omitted", async () => {
@@ -253,41 +230,25 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("admits the same rows on both paths for any metadata shape", async () => {
-		// Each shape once split the paths: SQLite and JS coerce arrays, objects,
-		// numbers, case, and Unicode whitespace differently.
-		const shapes: Array<{ id: string; metadata: Record<string, unknown>; memoryType?: string; superseded?: string }> = [
-			{ id: "baseline", metadata: { kind: "fact", cwd: "ROOT" } },
-			{ id: "kind-array", metadata: { kind: ["fact"], cwd: "ROOT" } },
-			{ id: "kind-object", metadata: { kind: { name: "fact" }, cwd: "ROOT" }, memoryType: "fact" },
-			{ id: "kind-number", metadata: { kind: 7, cwd: "ROOT" }, memoryType: "fact" },
-			{ id: "kind-nbsp", metadata: { kind: "\u00a0fact", cwd: "ROOT" } },
-			{ id: "kind-upper-spaced", metadata: { kind: " FACT ", cwd: "ROOT" } },
-			{ id: "task-key-array", metadata: { kind: "status", cwd: "ROOT", task_key: ["tracked"] } },
-			{ id: "task-key-zero", metadata: { kind: "status", cwd: "ROOT", task_key: 0 } },
-			{ id: "cwd-array", metadata: { kind: "fact", cwd: ["ROOT"] } },
-			{ id: "superseded-nbsp", metadata: { kind: "fact", cwd: "ROOT" }, superseded: "\u00a0" },
-		];
-		const forceFallback = (db: Database, sql: string, params: readonly unknown[], phase: "filtered" | "fallback"): Array<Record<string, unknown>> => {
-			if (phase === "filtered") throw new Error("forced");
-			return db.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
-		};
-		const run = async (fallback: boolean): Promise<string> => {
-			const fx = fixture();
-			try {
-				for (const shape of shapes) {
-					const metadata = JSON.parse(JSON.stringify(shape.metadata).replaceAll("ROOT", fx.root.replaceAll("\\", "\\\\")));
-					fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?)", [shape.id, `SHAPE-${shape.id}`, "test", "2026-09-09T00:00:00.000Z", JSON.stringify(metadata), shape.memoryType ?? null, shape.superseded ?? null]);
-				}
-				const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), ...(fallback ? { startupQueryExecutor: forceFallback } : {}) });
-				return output.hookSpecificOutput.additionalContext;
-			} finally { close(fx); }
-		};
-		const filtered = await run(false);
-		const fallback = await run(true);
-		expect(filtered).toContain("SHAPE-baseline");
-		const disagreements = shapes.map(shape => `SHAPE-${shape.id}`).filter(marker => filtered.includes(marker) !== fallback.includes(marker));
-		expect(disagreements).toEqual([]);
+	it("reads odd metadata the way JSON.parse does", async () => {
+		const fx = fixture();
+		try {
+			const raw = (id: string, content: string, metadataJson: string): void => {
+				fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json) VALUES (?, ?, ?, ?, ?)", [id, content, "test", "2026-09-09T00:00:00.000Z", metadataJson]);
+			};
+			const root = JSON.stringify(fx.root);
+			// JSON.parse keeps the last duplicate key; SQLite JSON functions would keep the first.
+			raw("dup-global", "preference with duplicate global keys", `{"global":true,"global":false,"kind":"preference"}`);
+			raw("kind-array", "fact whose kind is an array", `{"kind":["fact"],"cwd":${root}}`);
+			raw("cwd-true", "fact whose cwd is true", `{"kind":"fact","cwd":true}`);
+			raw("task-key-empty-array", "episode whose task_key is an empty array", `{"kind":"episode","cwd":${root},"task_key":[]}`);
+			const context = { ...fx.context, globalBank: "shared", recallBanks: ["default"] };
+			const output = (await sessionStart(fx.root, { context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(output).not.toContain("preference with duplicate global keys");
+			expect(output).toContain("fact whose kind is an array");
+			expect(output).not.toContain("fact whose cwd is true");
+			expect(output).not.toContain("episode whose task_key is an empty array");
+		} finally { close(fx); }
 	});
 
 	it("treats only JSON true as global in a non-global bank", async () => {
@@ -337,32 +298,6 @@ describe("SessionStart bounded metadata recall", () => {
 			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["malformed", "legacy preference", "test", "2026-09-10T00:00:00.000Z", "{not-json", "preference"]);
 			const output = await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") });
 			expect(output.hookSpecificOutput.additionalContext).toContain("legacy preference");
-		} finally { close(fx); }
-	});
-
-	it("surfaces a safe diagnostic when SQL filtering falls back to the bounded query", async () => {
-		const fx = fixture();
-		let forcedFailure = false;
-		try {
-			add(fx, "fallback-pref", "fallback preference", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
-			const output = await sessionStart(fx.root, {
-				context: fx.context,
-				now: new Date("2026-09-10T00:00:00.000Z"),
-				startupQueryExecutor: (db, sql, params, phase) => {
-					if (phase === "filtered" && !forcedFailure) {
-						forcedFailure = true;
-						throw new Error("forced SQL predicate failure with row content that must not surface");
-					}
-					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
-				},
-			});
-			const context = output.hookSpecificOutput.additionalContext;
-			expect(forcedFailure).toBe(true);
-			expect(output.systemMessage).toContain("STARTUP SQL FILTER FALLBACK: bank=default table=working_memory");
-			expect(output.systemMessage).not.toContain("forced SQL predicate failure");
-			expect(context).toContain("STARTUP RECALL DEGRADED");
-			expect(context).toContain("STARTUP SQL FILTER FALLBACK: bank=default table=working_memory");
-			expect(context).toContain("fallback preference");
 		} finally { close(fx); }
 	});
 
