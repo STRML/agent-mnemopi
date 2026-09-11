@@ -117,6 +117,24 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
+	it("drops project rows with an unparseable timestamp while keeping durable global rows", async () => {
+		const fx = fixture();
+		try {
+			// The startup window applies only to the project branch. Global curated
+			// rows stay durable, so a NULL timestamp keeps its row on one side of
+			// the predicate and discards it on the other.
+			const insert = "INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)";
+			fx.db.run(insert, ["null-global", "null timestamp global preference", "test", null, JSON.stringify({ kind: "preference" }), "preference"]);
+			fx.db.run(insert, ["null-project", "null timestamp project handoff", "test", null, JSON.stringify({ kind: "handoff", cwd: fx.root }), "handoff"]);
+			add(fx, "bad-project", "unparseable timestamp project handoff", { kind: "handoff", cwd: fx.root }, "not-a-date");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("null timestamp global preference");
+			expect(context).not.toContain("null timestamp project handoff");
+			expect(context).not.toContain("unparseable timestamp project handoff");
+			expect(context).toContain("STARTUP PROJECT ROWS OMITTED");
+		} finally { close(fx); }
+	});
+
 	it("keeps valid memory-type rows when metadata is malformed", async () => {
 		const fx = fixture();
 		try {
