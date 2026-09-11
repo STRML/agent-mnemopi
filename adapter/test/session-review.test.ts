@@ -145,7 +145,7 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("keeps session episodes out of startup so they cannot evict task state", async () => {
+	it("keeps session episodes out of startup", async () => {
 		const fx = fixture();
 		try {
 			// One episode can exceed the whole startup budget. Admitting them would
@@ -155,6 +155,60 @@ describe("SessionStart bounded metadata recall", () => {
 			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
 			expect(context).toContain("project handoff that must survive");
 			expect(context).not.toContain("project session episode transcript");
+		} finally { close(fx); }
+	});
+
+	it("admits a fact whose metadata kind is a falsy non-string", async () => {
+		const fx = fixture();
+		try {
+			// JS falls back from a falsy kind to memory_type; the SQL prefilter must too.
+			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type) VALUES (?, ?, ?, ?, ?, ?)", ["false-kind", "fact stored with kind false", "test", "2026-09-10T00:00:00.000Z", JSON.stringify({ kind: false, cwd: fx.root }), "fact"]);
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("fact stored with kind false");
+		} finally { close(fx); }
+	});
+
+	it("admits a row of any kind through task_key", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "status", "status row tracked by task key", { kind: "status", cwd: fx.root, task_key: "tracked" }, "2026-09-10T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("status row tracked by task key");
+			expect(context).toContain("kind=status");
+		} finally { close(fx); }
+	});
+
+	it("applies the same time rules on the SQL fallback path", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "fresh-fact", "fresh project fact", { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			add(fx, "old-fact", "project fact from two years ago", { kind: "fact", cwd: fx.root }, "2024-01-01T00:00:00.000Z");
+			add(fx, "old-handoff", "project handoff from two years ago", { kind: "handoff", cwd: fx.root }, "2024-01-01T00:00:00.000Z");
+			add(fx, "future-pref", "preference dated in the future", { kind: "preference" }, "2026-09-11T00:00:00.000Z");
+			const output = await sessionStart(fx.root, {
+				context: fx.context,
+				now: new Date("2026-09-10T00:00:00.000Z"),
+				startupQueryExecutor: (db, sql, params, phase) => {
+					if (phase === "filtered") throw new Error("forced");
+					return db.query(sql).all(...params) as Array<Record<string, unknown>>;
+				},
+			});
+			const context = output.hookSpecificOutput.additionalContext;
+			expect(context).toContain("STARTUP SQL FILTER FALLBACK");
+			expect(context).toContain("fresh project fact");
+			expect(context).not.toContain("project fact from two years ago");
+			expect(context).not.toContain("project handoff from two years ago");
+			expect(context).not.toContain("preference dated in the future");
+		} finally { close(fx); }
+	});
+
+	it("does not count an admitted global row as an omitted project row", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "global-tracked", "old global preference with a task key", { kind: "preference", cwd: fx.root, task_key: "tracked" }, "2024-01-01T00:00:00.000Z");
+			const context = (await sessionStart(fx.root, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("old global preference with a task key");
+			expect(context).not.toContain("STARTUP PROJECT ROWS OMITTED");
 		} finally { close(fx); }
 	});
 

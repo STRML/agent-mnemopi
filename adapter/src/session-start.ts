@@ -152,6 +152,18 @@ function isExpired(validUntil: string, now: Date): boolean {
 	return Number.isFinite(parsed) && parsed <= now.getTime();
 }
 
+/** JS mirror of the SQL project window, so the fallback path cannot admit what the filtered path excludes. */
+function withinLookback(timestamp: string, now: Date): boolean {
+	const parsed = Date.parse(timestamp);
+	return Number.isFinite(parsed) && parsed >= now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000 && parsed <= now.getTime();
+}
+
+/** JS mirror of the SQL global rule: keep old and unparseable timestamps, never future ones. */
+function notFuture(timestamp: string, now: Date): boolean {
+	const parsed = Date.parse(timestamp);
+	return !Number.isFinite(parsed) || parsed <= now.getTime();
+}
+
 function kindOf(metadata: Record<string, unknown>, row: RawRow): string {
 	return text(metadata.kind || row.memory_type).trim().toLowerCase();
 }
@@ -168,9 +180,11 @@ function rowToMemory(row: RawRow, bank: string, globalBank: string, projectRoot:
 	const kind = kindOf(metadata, row);
 	const global = bank === globalBank || Boolean(metadata.global === true);
 	const projectMatch = cwd.length > 0 && path.resolve(cwd) === projectRoot;
-	const curated = (global && CURATED_KINDS.has(kind)) ||
-		(projectMatch && (PROJECT_KINDS.has(kind) || taskKey.length > 0));
-	if (!curated) return null;
+	// Mirror the SQL time predicates so the fallback path admits the same rows.
+	const timed = "timestamp" in row;
+	const globalAdmit = global && CURATED_KINDS.has(kind) && (!timed || notFuture(timestamp ?? "", now));
+	const projectAdmit = projectMatch && (PROJECT_KINDS.has(kind) || taskKey.length > 0) && (!timed || withinLookback(timestamp ?? "", now));
+	if (!globalAdmit && !projectAdmit) return null;
 	if (text(row.superseded_by).trim()) return null;
 	return {
 		id,
@@ -209,6 +223,36 @@ function tableColumns(db: Database, table: string): Set<string> {
 	);
 }
 
+// Use guarded JSON extraction so one malformed metadata blob cannot turn a
+// whole bank into a startup failure. JS still performs the authoritative path,
+// type, and time checks after this SQL-side candidate reduction, so every
+// expression here must admit at least what rowToMemory admits. Both startup
+// queries build their predicates here so they cannot drift from each other.
+function metadataSql(columns: Set<string>, bank: string, globalBank: string): { globalScope: string; projectScope: string } {
+	const metadata = columns.has("metadata_json")
+		? "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END"
+		: "'{}'";
+	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
+	// Mirror JS `||`: JSON null, false, 0, and "" count as absent, so a falsy
+	// kind falls back to memory_type here exactly as it does in kindOf.
+	const field = (key: string): string =>
+		`(CASE WHEN json_type(${metadata}, '${key}') IN ('null', 'false') THEN NULL WHEN json_type(${metadata}, '${key}') IN ('integer', 'real') AND ${json(key)} = 0 THEN NULL ELSE NULLIF(CAST(${json(key)} AS TEXT), '') END)`;
+	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
+	const kind = `lower(trim(COALESCE(${field("$.kind")}, ${memoryType}, '')))`;
+	const taskKey = `trim(COALESCE(${field("$.task_key")}, ${field("$.taskKey")}, ''))`;
+	const cwd = field("$.cwd");
+	const global = bank === globalBank ? "1 = 1" : `COALESCE(${json("$.global")}, 0) = 1`;
+	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
+	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
+	// cwd as a project candidate and let rowToMemory perform the authoritative
+	// path comparison. This is intentionally conservative: unrelated project
+	// rows may be read, but they are bounded below and discarded before output.
+	return {
+		globalScope: `(${global} AND ${kind} IN (${sqlKindList(CURATED_KINDS)}))`,
+		projectScope: `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''))`,
+	};
+}
+
 function startupQuery(
 	table: string,
 	columns: Set<string>,
@@ -216,26 +260,7 @@ function startupQuery(
 	globalBank: string,
 	now: Date,
 ): { sql: string; params: unknown[] } {
-	// Use guarded JSON extraction so one malformed metadata blob cannot turn a
-	// whole bank into a startup failure. JS still performs the authoritative
-	// path and type checks after this SQL-side candidate reduction.
-	const metadata = columns.has("metadata_json")
-		? "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END"
-		: "'{}'";
-	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
-	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
-	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
-	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
-	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
-	const globalKind = `${kind} IN (${sqlKindList(CURATED_KINDS)})`;
-	const projectKind = `${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''`;
-	const globalScope = bank === globalBank ? "1 = 1" : `${json("$.global")} = 1`;
-	// SQLite cannot reproduce JS's path.resolve(cwd) semantics for relative,
-	// trailing-slash, or otherwise normalizable paths. Treat every non-empty
-	// cwd as a project candidate and let rowToMemory perform the authoritative
-	// path comparison. This is intentionally conservative: unrelated project
-	// rows may be read, but they are bounded below and discarded before output.
-	const projectScope = `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${projectKind}))`;
+	const { globalScope, projectScope } = metadataSql(columns, bank, globalBank);
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const params: unknown[] = [];
 	let conditions: string[];
@@ -245,10 +270,10 @@ function startupQuery(
 		// Project-scoped rows remain bounded to the startup lookback window.
 		const globalTime = "(timestamp IS NULL OR datetime(timestamp) IS NULL OR datetime(timestamp) <= datetime(?))";
 		const projectTime = "(datetime(timestamp) >= datetime(?) AND datetime(timestamp) <= datetime(?))";
-		conditions = [`((${globalScope} AND ${globalKind} AND ${globalTime}) OR (${projectScope} AND ${projectTime}))`];
+		conditions = [`((${globalScope} AND ${globalTime}) OR (${projectScope} AND ${projectTime}))`];
 		params.push(now.toISOString(), cutoff, now.toISOString());
 	} else {
-		conditions = [`((${globalScope} AND ${globalKind}) OR ${projectScope})`];
+		conditions = [`(${globalScope} OR ${projectScope})`];
 	}
 	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
 	const order = columns.has("timestamp") ? "timestamp DESC, id ASC" : "id ASC";
@@ -274,19 +299,14 @@ function fallbackOmissionCount(db: Database, table: string): number {
 	}
 }
 
-function boundedProjectOmissionCount(db: Database, table: string, columns: Set<string>, now: Date): number {
+function boundedProjectOmissionCount(db: Database, table: string, columns: Set<string>, now: Date, bank: string, globalBank: string): number {
 	if (!columns.has("timestamp") || !columns.has("metadata_json")) return 0;
-	const metadata = "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END";
-	const json = (key: string): string => `json_extract(${metadata}, '${key}')`;
-	const memoryType = columns.has("memory_type") ? "memory_type" : "NULL";
-	const kind = `lower(trim(COALESCE(NULLIF(CAST(${json("$.kind")} AS TEXT), ''), ${memoryType}, ''))) `;
-	const taskKey = `trim(COALESCE(NULLIF(CAST(${json("$.task_key")} AS TEXT), ''), NULLIF(CAST(${json("$.taskKey")} AS TEXT), ''), ''))`;
-	const cwd = `CAST(${json("$.cwd")} AS TEXT)`;
-	const projectKind = `${kind} IN (${sqlKindList(PROJECT_KINDS)}) OR ${taskKey} <> ''`;
-	const projectScope = `(${cwd} IS NOT NULL AND trim(${cwd}) <> '' AND (${projectKind}))`;
+	const { globalScope, projectScope } = metadataSql(columns, bank, globalBank);
 	const cutoff = new Date(now.getTime() - STARTUP_LOOKBACK_DAYS * 86_400_000).toISOString();
 	const conditions = [
 		projectScope,
+		// A global curated row is admitted on its own rule, so its age is not a project omission.
+		`NOT ${globalScope}`,
 		"(datetime(timestamp) IS NULL OR datetime(timestamp) < datetime(?) OR datetime(timestamp) > datetime(?))",
 	];
 	if (columns.has("superseded_by")) conditions.push("(superseded_by IS NULL OR trim(superseded_by) = '')");
@@ -341,7 +361,7 @@ function readBank(
 					if (omitted > 0) notes.push(`STARTUP COMPATIBILITY ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; SQLite JSON filtering was unavailable and the ${SQL_FALLBACK_ROW_LIMIT}-row safety cap applied`);
 					diagnostics.push(`STARTUP SQL FILTER FALLBACK: bank=${bank} table=${table}; JS metadata filtering remained authoritative`);
 				}
-				const omitted = boundedProjectOmissionCount(db, table, columns, now);
+				const omitted = boundedProjectOmissionCount(db, table, columns, now, bank, globalBank);
 				if (omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
 			}
 			return {
