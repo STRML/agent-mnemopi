@@ -722,6 +722,9 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	// OMP writes these; startup only reads them, and a missing directory is the
 	// normal case on a project OMP has never opened.
 	const decisions = readSharpshooterDecisions(context, now);
+	// A bank reached through a link is refused, and silence would read exactly like
+	// a project OMP has never opened. Say which one it was.
+	if (decisions.redirected) notes.push("SHARPSHOOTER BANK REDIRECTED: the decision directory is not a plain path; no project decisions were read");
 	const decisionBlock = decisions.lines.join("\n");
 	const decisionCost = decisionBlock.length === 0 ? 0 : Math.min(SHARPSHOOTER_RESERVE_CHARS, decisionBlock.length + 1);
 	const limit = STARTUP_LIMIT + decisionCost;

@@ -1004,6 +1004,46 @@ describe("SessionStart sharpshooter decisions", () => {
 		} finally { close(fx); }
 	});
 
+	it("stays inside the bound when two diagnostics would each fit alone", () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": `- ${"rule ".repeat(60)}`, "product.md": "- Another rule." });
+			chmodSync(path.join(dir, "product.md"), 0o000);
+			// An unreadable note and an omitted note coexist here. Admitted one at a
+			// time they each fit budgets that cannot hold both.
+			for (let maxChars = 1; maxChars <= 400; maxChars++) {
+				const decisions = readSharpshooterDecisions(fx.context, now, maxChars);
+				const size = decisions.lines.reduce((sum, line) => sum + line.length + 1, 0);
+				expect(size).toBeLessThanOrEqual(maxChars);
+			}
+			chmodSync(path.join(dir, "product.md"), 0o600);
+		} finally { close(fx); }
+	});
+
+	it("says so when the bank path is redirected rather than staying silent", async () => {
+		const fx = fixture();
+		try {
+			const bank = decide(fx, { "architecture.md": "- Real rule." });
+			const elsewhere = path.join(fx.root, "elsewhere-quiet");
+			mkdirSync(elsewhere, { recursive: true });
+			rmSync(bank, { recursive: true, force: true });
+			symlinkSync(elsewhere, bank);
+			const context = await start(fx);
+			expect(context).toContain("SHARPSHOOTER BANK REDIRECTED");
+		} finally { close(fx); }
+	});
+
+	it("bounds the read by its own buffer, not by the size the stat saw", () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			writeFileSync(path.join(dir, "product.md"), "x".repeat(128 * 1024 + 512));
+			const decisions = readSharpshooterDecisions(fx.context, now);
+			expect(decisions.unreadable).toBe(1);
+			expect(decisions.lines.join("\n")).not.toContain("xxxxxxxxxx");
+		} finally { close(fx); }
+	});
+
 	it("reads nothing when the bank directory itself is redirected", async () => {
 		const fx = fixture();
 		try {

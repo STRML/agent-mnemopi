@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import * as path from "node:path";
 import { getMemoriesDir } from "@oh-my-pi/pi-utils";
 import type { AdapterContext } from "./context";
@@ -16,11 +16,11 @@ const SHARPSHOOTER_FILES = ["architecture.md", "product.md", "style.md"] as cons
 /**
  * Cap on the injected block, matching the store's own startup budget.
  *
- * OMP caps each file at 120 lines, so three full files can reach roughly 36,000
- * characters, far past anything worth injecting. Measured against 13 real project
- * banks, the largest holds 5,206 characters across all three files and the rest
- * are under 2,400, so this fits every observed project and still bounds the worst
- * case. A file past the cap is left out whole and counted.
+ * Measured against 13 real project banks, the largest holds 5,206 characters
+ * across all three files and the rest are under 2,400, so this fits every
+ * observed project. OMP's 120-line cap says nothing about line length, so it
+ * gives no upper bound of its own; that is what the byte cap below is for. A
+ * file past this cap is left out whole and counted.
  */
 export const SHARPSHOOTER_RESERVE_CHARS = 6000;
 /**
@@ -57,7 +57,7 @@ export function sharpshooterBankDir(context: AdapterContext): string {
  * directory. A symlinked parent redirects the whole bank, which the per-file
  * check cannot see, so the path is walked before any file in it is opened.
  */
-function bankPathIsPlain(context: AdapterContext): boolean {
+function bankPathState(context: AdapterContext): "ok" | "missing" | "redirected" {
 	const root = getMemoriesDir(context.agentDir);
 	// The memories root is walked too: a link there redirects everything below it,
 	// and checking only the segments under it would miss that.
@@ -65,12 +65,14 @@ function bankPathIsPlain(context: AdapterContext): boolean {
 	for (const segment of [root, "sharpshooter", projectBankSegment(context.cwd)]) {
 		walked = walked ? path.join(walked, segment) : segment;
 		try {
-			if (!lstatSync(walked).isDirectory()) return false;
-		} catch {
-			return false;
+			// A link or a file where a directory belongs is worth reporting. A path
+			// that simply is not there is a project OMP has never opened.
+			if (!lstatSync(walked).isDirectory()) return "redirected";
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "redirected";
 		}
 	}
-	return true;
+	return "ok";
 }
 
 /**
@@ -81,19 +83,27 @@ function bankPathIsPlain(context: AdapterContext): boolean {
  * leaf, and `O_NONBLOCK` keeps a FIFO from parking startup forever: this runs
  * before the hook answers, and a blocked read is a hung session.
  *
- * The size cap bounds what is loaded, not just what is injected. OMP writes at
- * most 120 lines per file, so anything past the cap is not a decision file; it
- * is reported rather than truncated, because half a rule set reads like a whole
- * one.
+ * The cap bounds the read itself, not just what is injected. The buffer is
+ * fixed and one byte larger than the cap, so a file that grew between the stat
+ * and the read cannot pull in more than that: the extra byte is what proves it
+ * overflowed. OMP writes at most 120 lines per file, so anything at the cap is
+ * not a decision file. It is reported rather than truncated, because half a
+ * rule set reads like a whole one.
  */
 function readFile(dir: string, name: string): { text: string; failed: boolean } {
 	let fd: number | undefined;
 	try {
 		fd = openSync(path.join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-		const info = fstatSync(fd);
-		if (!info.isFile()) return { text: "", failed: false };
-		if (info.size > SHARPSHOOTER_MAX_FILE_BYTES) return { text: "", failed: true };
-		return { text: readFileSync(fd).toString("utf8").trim(), failed: false };
+		if (!fstatSync(fd).isFile()) return { text: "", failed: false };
+		const buffer = Buffer.alloc(SHARPSHOOTER_MAX_FILE_BYTES + 1);
+		let filled = 0;
+		while (filled < buffer.length) {
+			const read = readSync(fd, buffer, filled, buffer.length - filled, null);
+			if (read === 0) break;
+			filled += read;
+		}
+		if (filled > SHARPSHOOTER_MAX_FILE_BYTES) return { text: "", failed: true };
+		return { text: buffer.subarray(0, filled).toString("utf8").trim(), failed: false };
 	} catch (error) {
 		// A file OMP never wrote is the normal case; anything else is worth reporting.
 		const code = (error as NodeJS.ErrnoException).code;
@@ -127,8 +137,10 @@ function consolidatedAt(dir: string, now: Date): string | undefined {
  */
 export function readSharpshooterDecisions(context: AdapterContext, now: Date, maxChars = SHARPSHOOTER_RESERVE_CHARS): SharpshooterDecisions {
 	// A redirected bank is reported, not read: silently injecting another
-	// directory's rules is worse than injecting none.
-	if (!bankPathIsPlain(context)) return { lines: [], omittedFiles: 0, unreadable: 0, redirected: true };
+	// directory's rules is worse than injecting none. A missing one is the normal
+	// case on a project OMP has never opened, and says nothing.
+	const state = bankPathState(context);
+	if (state !== "ok") return { lines: [], omittedFiles: 0, unreadable: 0, ...(state === "redirected" ? { redirected: true } : {}) };
 	const dir = sharpshooterBankDir(context);
 	const read = SHARPSHOOTER_FILES.map(name => ({ name, ...readFile(dir, name) }));
 	// A file that exists but cannot be read is a hole in the rule set, so say so
@@ -160,9 +172,16 @@ export function readSharpshooterDecisions(context: AdapterContext, now: Date, ma
 		used += block.length + 1;
 	}
 	const omittedFiles = blocks.length - shown.length;
-	// A heading over no rules states nothing; the counts alone are the honest report,
-	// and they are dropped too when even one line is past the budget.
-	const tail = [...notes, omitted(omittedFiles)].filter(fits);
-	if (shown.length === 0) return { lines: tail, omittedFiles, unreadable };
-	return { lines: [heading, ...shown, ...tail], omittedFiles, unreadable };
+	// A heading over no rules states nothing; the counts alone are the honest
+	// report. They are admitted against the room actually left, not one at a time,
+	// so two diagnostics cannot together overrun a budget each of them fits.
+	const head = shown.length === 0 ? [] : [heading, ...shown];
+	let left = maxChars - size(head);
+	const tail: string[] = [];
+	for (const line of [...notes, omitted(omittedFiles)]) {
+		if (line.length + 1 > left) continue;
+		tail.push(line);
+		left -= line.length + 1;
+	}
+	return { lines: [...head, ...tail], omittedFiles, unreadable };
 }
