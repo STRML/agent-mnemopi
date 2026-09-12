@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { review, reviewDue } from "../src/review";
 import { sessionStart, startupDbPath } from "../src/session-start";
-import { sharpshooterBankDir } from "../src/sharpshooter";
+import { readSharpshooterDecisions, sharpshooterBankDir } from "../src/sharpshooter";
 import { projectBankSegment } from "../src/vendor/omp-config";
 import type { AdapterContext } from "../src/context";
 import { selectInjectableRecall, type RecallCandidate } from "../src/reliability/policy";
@@ -960,6 +960,47 @@ describe("SessionStart sharpshooter decisions", () => {
 			expect(context).toContain("- One rule.");
 			// A redirected state file must not be able to stamp an age on the block.
 			expect(context).not.toContain("days ago");
+		} finally { close(fx); }
+	});
+
+	it("reads nothing when the memories root itself is redirected", async () => {
+		const fx = fixture();
+		try {
+			const bank = decide(fx, { "architecture.md": "- Real rule." });
+			const memories = path.dirname(path.dirname(bank));
+			const elsewhere = path.join(fx.root, "elsewhere-memories");
+			mkdirSync(path.join(elsewhere, "sharpshooter", path.basename(bank)), { recursive: true });
+			writeFileSync(path.join(elsewhere, "sharpshooter", path.basename(bank), "architecture.md"), "- PLANTED ROOT RULE.");
+			rmSync(memories, { recursive: true, force: true });
+			symlinkSync(elsewhere, memories);
+			const context = await start(fx);
+			expect(context).not.toContain("PLANTED ROOT RULE");
+			expect(context).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("refuses a decision file larger than the read cap instead of loading it", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			// Past the 128 KiB cap on a single line, which the 120-line limit does not bound.
+			writeFileSync(path.join(dir, "product.md"), `- ${"x".repeat(200_000)}`);
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).toContain("SHARPSHOOTER FILES UNREADABLE: count=1");
+			expect(context).not.toContain("xxxxxxxxxx");
+		} finally { close(fx); }
+	});
+
+	it("honours its own character bound at every budget", () => {
+		const fx = fixture();
+		try {
+			decide(fx, { "architecture.md": "- One rule.", "product.md": "- Another rule." }, Date.parse("2026-09-08T00:00:00.000Z"));
+			for (let maxChars = 1; maxChars <= 400; maxChars++) {
+				const decisions = readSharpshooterDecisions(fx.context, now, maxChars);
+				const size = decisions.lines.reduce((sum, line) => sum + line.length + 1, 0);
+				expect(size).toBeLessThanOrEqual(maxChars);
+			}
 		} finally { close(fx); }
 	});
 

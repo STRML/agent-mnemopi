@@ -23,6 +23,14 @@ const SHARPSHOOTER_FILES = ["architecture.md", "product.md", "style.md"] as cons
  * case. A file past the cap is left out whole and counted.
  */
 export const SHARPSHOOTER_RESERVE_CHARS = 6000;
+/**
+ * Most a single decision file may be before it is refused unread.
+ *
+ * OMP caps each file at 120 lines, and the largest of 13 real banks holds 5,206
+ * characters across all three, so 128 KiB is far past any real file while still
+ * keeping a runaway one out of memory.
+ */
+const SHARPSHOOTER_MAX_FILE_BYTES = 128 * 1024;
 export const SHARPSHOOTER_HEADING = "PROJECT DECISIONS (sharpshooter; friction-earned rules for this project):";
 
 export interface SharpshooterDecisions {
@@ -50,9 +58,12 @@ export function sharpshooterBankDir(context: AdapterContext): string {
  * check cannot see, so the path is walked before any file in it is opened.
  */
 function bankPathIsPlain(context: AdapterContext): boolean {
-	let walked = getMemoriesDir(context.agentDir);
-	for (const segment of ["sharpshooter", projectBankSegment(context.cwd)]) {
-		walked = path.join(walked, segment);
+	const root = getMemoriesDir(context.agentDir);
+	// The memories root is walked too: a link there redirects everything below it,
+	// and checking only the segments under it would miss that.
+	let walked = "";
+	for (const segment of [root, "sharpshooter", projectBankSegment(context.cwd)]) {
+		walked = walked ? path.join(walked, segment) : segment;
 		try {
 			if (!lstatSync(walked).isDirectory()) return false;
 		} catch {
@@ -69,12 +80,19 @@ function bankPathIsPlain(context: AdapterContext): boolean {
  * swapped between the check and the read. `O_NOFOLLOW` refuses a symlinked
  * leaf, and `O_NONBLOCK` keeps a FIFO from parking startup forever: this runs
  * before the hook answers, and a blocked read is a hung session.
+ *
+ * The size cap bounds what is loaded, not just what is injected. OMP writes at
+ * most 120 lines per file, so anything past the cap is not a decision file; it
+ * is reported rather than truncated, because half a rule set reads like a whole
+ * one.
  */
 function readFile(dir: string, name: string): { text: string; failed: boolean } {
 	let fd: number | undefined;
 	try {
 		fd = openSync(path.join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-		if (!fstatSync(fd).isFile()) return { text: "", failed: false };
+		const info = fstatSync(fd);
+		if (!info.isFile()) return { text: "", failed: false };
+		if (info.size > SHARPSHOOTER_MAX_FILE_BYTES) return { text: "", failed: true };
 		return { text: readFileSync(fd).toString("utf8").trim(), failed: false };
 	} catch (error) {
 		// A file OMP never wrote is the normal case; anything else is worth reporting.
@@ -117,7 +135,13 @@ export function readSharpshooterDecisions(context: AdapterContext, now: Date, ma
 	// rather than presenting what is left as the whole of it.
 	const unreadable = read.filter(file => file.failed).length;
 	const files = read.filter(file => file.text.length > 0);
-	if (files.length === 0) return { lines: unreadable > 0 ? [unreadableNote(unreadable)] : [], omittedFiles: 0, unreadable };
+	// `maxChars` bounds everything returned, diagnostics included. A budget too
+	// small even for one line yields no lines; the counts still reach the caller.
+	const fits = (line: string): boolean => line.length + 1 <= maxChars;
+	if (files.length === 0) {
+		const note = unreadable > 0 && fits(unreadableNote(unreadable)) ? [unreadableNote(unreadable)] : [];
+		return { lines: note, omittedFiles: 0, unreadable };
+	}
 	const age = consolidatedAt(dir, now);
 	const heading = age ? `${SHARPSHOOTER_HEADING} ${age}` : SHARPSHOOTER_HEADING;
 	const blocks = files.map(file => `## ${file.name.slice(0, -3)}\n${file.text}`);
@@ -136,7 +160,9 @@ export function readSharpshooterDecisions(context: AdapterContext, now: Date, ma
 		used += block.length + 1;
 	}
 	const omittedFiles = blocks.length - shown.length;
-	// A heading over no rules states nothing; the counts alone are the honest report.
-	if (shown.length === 0) return { lines: [...notes, omitted(omittedFiles)], omittedFiles, unreadable };
-	return { lines: [heading, ...shown, ...notes, omitted(omittedFiles)], omittedFiles, unreadable };
+	// A heading over no rules states nothing; the counts alone are the honest report,
+	// and they are dropped too when even one line is past the budget.
+	const tail = [...notes, omitted(omittedFiles)].filter(fits);
+	if (shown.length === 0) return { lines: tail, omittedFiles, unreadable };
+	return { lines: [heading, ...shown, ...tail], omittedFiles, unreadable };
 }
