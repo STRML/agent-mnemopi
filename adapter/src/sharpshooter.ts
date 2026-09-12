@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { getMemoriesDir } from "@oh-my-pi/pi-utils";
 import type { AdapterContext } from "./context";
@@ -41,8 +41,9 @@ export function sharpshooterBankDir(context: AdapterContext): string {
 function readFile(dir: string, name: string): string {
 	try {
 		const file = path.join(dir, name);
-		// A symlink here would let a directory OMP owns point at any file on disk.
-		if (!statSync(file).isFile()) return "";
+		// lstat, not stat: stat follows a link, so a symlink planted in this directory
+		// would read any file on disk into the agent's context.
+		if (!lstatSync(file).isFile()) return "";
 		return readFileSync(file, "utf8").trim();
 	} catch {
 		return "";

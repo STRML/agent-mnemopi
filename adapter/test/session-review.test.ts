@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
@@ -946,6 +946,20 @@ describe("SessionStart sharpshooter decisions", () => {
 			const context = await start(fx);
 			expect(context).toContain("- One rule.");
 			expect(context).not.toContain("## product");
+		} finally { close(fx); }
+	});
+
+	it("never follows a symlink planted among the decision files", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			const secret = path.join(fx.root, "secret.txt");
+			writeFileSync(secret, "SHOULD-NEVER-REACH-THE-AGENT");
+			symlinkSync(secret, path.join(dir, "style.md"));
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).not.toContain("SHOULD-NEVER-REACH-THE-AGENT");
+			expect(context).not.toContain("## style");
 		} finally { close(fx); }
 	});
 
