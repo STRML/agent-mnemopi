@@ -723,10 +723,14 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	// normal case on a project OMP has never opened.
 	const decisions = readSharpshooterDecisions(context, now);
 	const decisionBlock = decisions.lines.join("\n");
-	const limit = STARTUP_LIMIT + Math.min(SHARPSHOOTER_RESERVE_CHARS, decisionBlock.length === 0 ? 0 : decisionBlock.length + 1);
-	// A caller that clamps the budget below the store's own limit grants the decisions
-	// nothing, so they are left out rather than crowding the rows the clamp was for.
-	const effectiveMax = Math.min(limit, Math.max(256, options.maxChars ?? limit));
+	const decisionCost = decisionBlock.length === 0 ? 0 : Math.min(SHARPSHOOTER_RESERVE_CHARS, decisionBlock.length + 1);
+	const limit = STARTUP_LIMIT + decisionCost;
+	const requested = Math.min(limit, Math.max(256, options.maxChars ?? limit));
+	// The decisions are paid for separately or not at all. A budget too small to
+	// hold the whole block grants them nothing, and the store keeps exactly its own
+	// limit rather than absorbing the leftover reserve.
+	const decisionBudget = requested - STARTUP_LIMIT >= decisionCost ? decisionCost : 0;
+	const effectiveMax = Math.min(requested, STARTUP_LIMIT + decisionBudget);
 	let reviewNote = reviewDueStatus(context, now);
 	const due = reviewDue(context.cwd, 7, { context, now });
 	if (due.status === "due") {

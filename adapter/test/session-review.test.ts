@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
@@ -946,6 +946,62 @@ describe("SessionStart sharpshooter decisions", () => {
 			const context = await start(fx);
 			expect(context).toContain("- One rule.");
 			expect(context).not.toContain("## product");
+		} finally { close(fx); }
+	});
+
+	it("never follows a symlinked state.json", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			const decoy = path.join(fx.root, "decoy-state.json");
+			writeFileSync(decoy, JSON.stringify({ v: 1, lastConsolidatedAt: Date.parse("2026-09-09T00:00:00.000Z") }));
+			symlinkSync(decoy, path.join(dir, "state.json"));
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			// A redirected state file must not be able to stamp an age on the block.
+			expect(context).not.toContain("days ago");
+		} finally { close(fx); }
+	});
+
+	it("reads nothing when the bank directory itself is redirected", async () => {
+		const fx = fixture();
+		try {
+			const real = decide(fx, { "architecture.md": "- Real rule." });
+			const elsewhere = path.join(fx.root, "elsewhere");
+			mkdirSync(elsewhere, { recursive: true });
+			writeFileSync(path.join(elsewhere, "architecture.md"), "- PLANTED RULE.");
+			rmSync(real, { recursive: true, force: true });
+			symlinkSync(elsewhere, real);
+			const context = await start(fx);
+			expect(context).not.toContain("PLANTED RULE");
+			expect(context).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("reports a decision file it cannot read instead of dropping it", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule.", "product.md": "- Another rule." });
+			chmodSync(path.join(dir, "product.md"), 0o000);
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).toContain("SHARPSHOOTER FILES UNREADABLE: count=1");
+			chmodSync(path.join(dir, "product.md"), 0o600);
+		} finally { close(fx); }
+	});
+
+	it("keeps the store at its own budget when the decisions do not fit", async () => {
+		const fx = fixture();
+		try {
+			for (let index = 0; index < 40; index++) add(fx, `f${index}`, `# Fact ${index}\n${"body ".repeat(50)}`, { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			await start(fx);
+			const baseline = await start(fx);
+			decide(fx, { "architecture.md": `- ${"rule ".repeat(80)}` });
+			// Granted less than the block costs: the block is left out, and the store
+			// must not absorb the leftover reserve as extra room.
+			const partial = await start(fx, 6200);
+			expect(partial).not.toContain("PROJECT DECISIONS");
+			expect(partial.length).toBeLessThanOrEqual(baseline.length);
 		} finally { close(fx); }
 	});
 

@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { getMemoriesDir } from "@oh-my-pi/pi-utils";
 import type { AdapterContext } from "./context";
@@ -30,30 +30,67 @@ export interface SharpshooterDecisions {
 	readonly lines: readonly string[];
 	/** Whole files left out because the block hit its cap. */
 	readonly omittedFiles: number;
+	/** Files that exist but could not be read, so the rule set has a hole in it. */
+	readonly unreadable: number;
+	/** The bank path is not a plain directory chain, so nothing was read. */
+	readonly redirected?: boolean;
 }
+
+const unreadableNote = (count: number): string =>
+	`SHARPSHOOTER FILES UNREADABLE: count=${count}; the project decisions below are incomplete`;
 
 /** Directory OMP writes this project's decision files to. */
 export function sharpshooterBankDir(context: AdapterContext): string {
 	return path.join(getMemoriesDir(context.agentDir), "sharpshooter", projectBankSegment(context.cwd));
 }
 
-/** Read one file's trimmed content; anything unreadable reads as empty. */
-function readFile(dir: string, name: string): string {
+/**
+ * True when every component from the memories root down to the bank is a real
+ * directory. A symlinked parent redirects the whole bank, which the per-file
+ * check cannot see, so the path is walked before any file in it is opened.
+ */
+function bankPathIsPlain(context: AdapterContext): boolean {
+	let walked = getMemoriesDir(context.agentDir);
+	for (const segment of ["sharpshooter", projectBankSegment(context.cwd)]) {
+		walked = path.join(walked, segment);
+		try {
+			if (!lstatSync(walked).isDirectory()) return false;
+		} catch {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Read one regular file under the bank, bounded, without following a link.
+ *
+ * Opened once and inspected through the descriptor, so the path cannot be
+ * swapped between the check and the read. `O_NOFOLLOW` refuses a symlinked
+ * leaf, and `O_NONBLOCK` keeps a FIFO from parking startup forever: this runs
+ * before the hook answers, and a blocked read is a hung session.
+ */
+function readFile(dir: string, name: string): { text: string; failed: boolean } {
+	let fd: number | undefined;
 	try {
-		const file = path.join(dir, name);
-		// lstat, not stat: stat follows a link, so a symlink planted in this directory
-		// would read any file on disk into the agent's context.
-		if (!lstatSync(file).isFile()) return "";
-		return readFileSync(file, "utf8").trim();
-	} catch {
-		return "";
+		fd = openSync(path.join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		if (!fstatSync(fd).isFile()) return { text: "", failed: false };
+		return { text: readFileSync(fd).toString("utf8").trim(), failed: false };
+	} catch (error) {
+		// A file OMP never wrote is the normal case; anything else is worth reporting.
+		const code = (error as NodeJS.ErrnoException).code;
+		return { text: "", failed: code !== "ENOENT" };
+	} finally {
+		if (fd !== undefined) closeSync(fd);
 	}
 }
 
 /** Age of the injection, so a stale file cannot pass for a current one. */
 function consolidatedAt(dir: string, now: Date): string | undefined {
 	try {
-		const parsed: unknown = JSON.parse(readFileSync(path.join(dir, "state.json"), "utf8"));
+		const state = readFile(dir, "state.json");
+		if (!state.text) return undefined;
+		const parsed: unknown = JSON.parse(state.text);
 		if (parsed === null || typeof parsed !== "object") return undefined;
 		const at = (parsed as { lastConsolidatedAt?: unknown }).lastConsolidatedAt;
 		if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return undefined;
@@ -71,25 +108,35 @@ function consolidatedAt(dir: string, now: Date): string | undefined {
  * rather than injected as a fragment that reads like the complete rule set.
  */
 export function readSharpshooterDecisions(context: AdapterContext, now: Date, maxChars = SHARPSHOOTER_RESERVE_CHARS): SharpshooterDecisions {
+	// A redirected bank is reported, not read: silently injecting another
+	// directory's rules is worse than injecting none.
+	if (!bankPathIsPlain(context)) return { lines: [], omittedFiles: 0, unreadable: 0, redirected: true };
 	const dir = sharpshooterBankDir(context);
-	const files = SHARPSHOOTER_FILES.map(name => ({ name, content: readFile(dir, name) })).filter(file => file.content.length > 0);
-	if (files.length === 0) return { lines: [], omittedFiles: 0 };
+	const read = SHARPSHOOTER_FILES.map(name => ({ name, ...readFile(dir, name) }));
+	// A file that exists but cannot be read is a hole in the rule set, so say so
+	// rather than presenting what is left as the whole of it.
+	const unreadable = read.filter(file => file.failed).length;
+	const files = read.filter(file => file.text.length > 0);
+	if (files.length === 0) return { lines: unreadable > 0 ? [unreadableNote(unreadable)] : [], omittedFiles: 0, unreadable };
 	const age = consolidatedAt(dir, now);
 	const heading = age ? `${SHARPSHOOTER_HEADING} ${age}` : SHARPSHOOTER_HEADING;
-	const blocks = files.map(file => `## ${file.name.slice(0, -3)}\n${file.content}`);
+	const blocks = files.map(file => `## ${file.name.slice(0, -3)}\n${file.text}`);
+	// The note counts against the budget but is not a file, so it is never part of
+	// the omitted-file count.
+	const notes = unreadable > 0 ? [unreadableNote(unreadable)] : [];
 	const size = (values: readonly string[]): number => values.reduce((sum, value) => sum + value.length + 1, 0);
-	if (size([heading, ...blocks]) <= maxChars) return { lines: [heading, ...blocks], omittedFiles: 0 };
+	if (size([heading, ...blocks, ...notes]) <= maxChars) return { lines: [heading, ...blocks, ...notes], omittedFiles: 0, unreadable };
 	// Something will not fit, so the omission line is part of the budget from here on.
 	const omitted = (count: number): string => `SHARPSHOOTER FILES OMITTED: count=${count}; they exceeded the block budget`;
-	const lines: string[] = [heading];
-	let used = heading.length + 1 + omitted(blocks.length).length + 1;
+	const shown: string[] = [];
+	let used = heading.length + 1 + omitted(blocks.length).length + 1 + size(notes);
 	for (const block of blocks) {
 		if (used + block.length + 1 > maxChars) continue;
-		lines.push(block);
+		shown.push(block);
 		used += block.length + 1;
 	}
-	const omittedFiles = blocks.length - (lines.length - 1);
-	// A heading over no rules states nothing; the omission alone is the honest report.
-	if (lines.length === 1) return { lines: [omitted(omittedFiles)], omittedFiles };
-	return { lines: [...lines, omitted(omittedFiles)], omittedFiles };
+	const omittedFiles = blocks.length - shown.length;
+	// A heading over no rules states nothing; the counts alone are the honest report.
+	if (shown.length === 0) return { lines: [...notes, omitted(omittedFiles)], omittedFiles, unreadable };
+	return { lines: [heading, ...shown, ...notes, omitted(omittedFiles)], omittedFiles, unreadable };
 }
