@@ -16,19 +16,20 @@ const SHARPSHOOTER_FILES = ["architecture.md", "product.md", "style.md"] as cons
 /**
  * Cap on the injected block, matching the store's own startup budget.
  *
- * Measured against 13 real project banks, the largest holds 5,206 characters
- * across all three files and the rest are under 2,400, so this fits every
- * observed project. OMP's 120-line cap says nothing about line length, so it
- * gives no upper bound of its own; that is what the byte cap below is for. A
- * file past this cap is left out whole and counted.
+ * Measured against 13 real project banks, the largest holds 5,206 bytes across
+ * all three files and the rest are under 2,400, so this fits every observed
+ * project. OMP's 120-line cap says nothing about line length, so it gives no
+ * upper bound of its own; that is what the byte cap below is for. A file past
+ * this cap is left out whole and counted.
  */
 export const SHARPSHOOTER_RESERVE_CHARS = 6000;
 /**
  * Most a single decision file may be before it is refused unread.
  *
  * OMP caps each file at 120 lines, and the largest of 13 real banks holds 5,206
- * characters across all three, so 128 KiB is far past any real file while still
- * keeping a runaway one out of memory.
+ * bytes across all three, so 128 KiB is far past any real file while still
+ * keeping a runaway one out of memory. A file of exactly this size is read; only
+ * a larger one is refused.
  */
 const SHARPSHOOTER_MAX_FILE_BYTES = 128 * 1024;
 export const SHARPSHOOTER_HEADING = "PROJECT DECISIONS (sharpshooter; friction-earned rules for this project):";
@@ -84,11 +85,16 @@ function bankPathState(context: AdapterContext): "ok" | "missing" | "redirected"
  * before the hook answers, and a blocked read is a hung session.
  *
  * The cap bounds the read itself, not just what is injected. The buffer is
- * fixed and one byte larger than the cap, so a file that grew between the stat
- * and the read cannot pull in more than that: the extra byte is what proves it
- * overflowed. OMP writes at most 120 lines per file, so anything at the cap is
- * not a decision file. It is reported rather than truncated, because half a
- * rule set reads like a whole one.
+ * fixed and one byte larger than the cap, so a file that grew after it was
+ * opened cannot pull in more than that: the extra byte is what proves it went
+ * over. A file larger than the cap is reported rather than truncated, because
+ * half a rule set reads like a whole one.
+ *
+ * What this does not cover: the directory chain is checked before the files are
+ * opened, and `O_NOFOLLOW` guards only the final name, so a parent swapped for a
+ * link in between is not caught. That race needs write access to the agent's own
+ * memories directory, and anyone holding it can rewrite the decision files
+ * directly. The guard is for a stale or careless link, not a live local attacker.
  */
 function readFile(dir: string, name: string): { text: string; failed: boolean } {
 	let fd: number | undefined;
