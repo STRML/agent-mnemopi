@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { review, reviewDue } from "../src/review";
 import { sessionStart, startupDbPath } from "../src/session-start";
+import { readSharpshooterDecisions, sharpshooterBankDir } from "../src/sharpshooter";
+import { projectBankSegment } from "../src/vendor/omp-config";
 import type { AdapterContext } from "../src/context";
 import { selectInjectableRecall, type RecallCandidate } from "../src/reliability/policy";
 
@@ -867,6 +869,309 @@ describe("non-destructive review snapshots", () => {
 			expect(result.status).toBe("error");
 			const files = existsSync(path.join(fx.context.dataDir, ".adapter-review")) ? readdirSync(path.join(fx.context.dataDir, ".adapter-review")) : [];
 			expect(files.length).toBe(0);
+		} finally { close(fx); }
+	});
+});
+
+describe("SessionStart sharpshooter decisions", () => {
+	const now = new Date("2026-09-10T00:00:00.000Z");
+	const start = async (fx: Fixture, maxChars?: number): Promise<string> =>
+		(await sessionStart(fx.root, { context: fx.context, now, ...(maxChars ? { maxChars } : {}) })).hookSpecificOutput.additionalContext;
+	/** Write decision files where OMP writes them for this project. */
+	const decide = (fx: Fixture, files: Record<string, string>, consolidatedAt?: number): string => {
+		const dir = sharpshooterBankDir(fx.context);
+		mkdirSync(dir, { recursive: true });
+		for (const [name, content] of Object.entries(files)) writeFileSync(path.join(dir, name), content);
+		if (consolidatedAt !== undefined) writeFileSync(path.join(dir, "state.json"), JSON.stringify({ v: 1, lastConsolidatedAt: consolidatedAt }));
+		return dir;
+	};
+
+	it("reads the same bank directory OMP writes for this project", () => {
+		const fx = fixture();
+		try {
+			expect(sharpshooterBankDir(fx.context).endsWith(path.join("sharpshooter", projectBankSegment(fx.root)))).toBe(true);
+		} finally { close(fx); }
+	});
+
+	it("injects the decision files with the age of their last consolidation", async () => {
+		const fx = fixture();
+		try {
+			decide(fx, { "architecture.md": "# Architecture\n- Deploy through the script, never by hand." }, Date.parse("2026-09-08T00:00:00.000Z"));
+			const context = await start(fx);
+			expect(context).toContain("PROJECT DECISIONS");
+			expect(context).toContain("Deploy through the script, never by hand.");
+			expect(context).toContain("2.0 days ago");
+		} finally { close(fx); }
+	});
+
+	it("leaves the context byte-identical when the project has no decision files", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "handoff", "yesterday's handoff", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			await start(fx);
+			const before = await start(fx);
+			decide(fx, { "architecture.md": "", "product.md": "   ", "style.md": "\n\n" });
+			expect(await start(fx)).toBe(before);
+			expect(before).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("gives no heading to a file with no content", async () => {
+		const fx = fixture();
+		try {
+			decide(fx, { "architecture.md": "- One rule.", "product.md": "", "style.md": "" });
+			const context = await start(fx);
+			expect(context).toContain("## architecture");
+			expect(context).not.toContain("## product");
+			expect(context).not.toContain("## style");
+		} finally { close(fx); }
+	});
+
+	it("keeps the decisions when the consolidation state is unreadable", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			writeFileSync(path.join(dir, "state.json"), "{not json");
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).not.toContain("days ago");
+		} finally { close(fx); }
+	});
+
+	it("ignores a decision path that is not a regular file", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			mkdirSync(path.join(dir, "product.md"), { recursive: true });
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).not.toContain("## product");
+		} finally { close(fx); }
+	});
+
+	it("never follows a symlinked state.json", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			const decoy = path.join(fx.root, "decoy-state.json");
+			writeFileSync(decoy, JSON.stringify({ v: 1, lastConsolidatedAt: Date.parse("2026-09-09T00:00:00.000Z") }));
+			symlinkSync(decoy, path.join(dir, "state.json"));
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			// A redirected state file must not be able to stamp an age on the block.
+			expect(context).not.toContain("days ago");
+		} finally { close(fx); }
+	});
+
+	it("reads nothing when the memories root itself is redirected", async () => {
+		const fx = fixture();
+		try {
+			const bank = decide(fx, { "architecture.md": "- Real rule." });
+			const memories = path.dirname(path.dirname(bank));
+			const elsewhere = path.join(fx.root, "elsewhere-memories");
+			mkdirSync(path.join(elsewhere, "sharpshooter", path.basename(bank)), { recursive: true });
+			writeFileSync(path.join(elsewhere, "sharpshooter", path.basename(bank), "architecture.md"), "- PLANTED ROOT RULE.");
+			rmSync(memories, { recursive: true, force: true });
+			symlinkSync(elsewhere, memories);
+			const context = await start(fx);
+			expect(context).not.toContain("PLANTED ROOT RULE");
+			expect(context).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("refuses a decision file larger than the read cap instead of loading it", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			// Past the 128 KiB cap on a single line, which the 120-line limit does not bound.
+			writeFileSync(path.join(dir, "product.md"), `- ${"x".repeat(200_000)}`);
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).toContain("SHARPSHOOTER FILES UNREADABLE: count=1");
+			expect(context).not.toContain("xxxxxxxxxx");
+		} finally { close(fx); }
+	});
+
+	it("honours its own character bound at every budget", () => {
+		const fx = fixture();
+		try {
+			decide(fx, { "architecture.md": "- One rule.", "product.md": "- Another rule." }, Date.parse("2026-09-08T00:00:00.000Z"));
+			for (let maxChars = 1; maxChars <= 400; maxChars++) {
+				const decisions = readSharpshooterDecisions(fx.context, now, maxChars);
+				const size = decisions.lines.reduce((sum, line) => sum + line.length + 1, 0);
+				expect(size).toBeLessThanOrEqual(maxChars);
+			}
+		} finally { close(fx); }
+	});
+
+	it("stays inside the bound when two diagnostics would each fit alone", () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": `- ${"rule ".repeat(60)}`, "product.md": "- Another rule." });
+			chmodSync(path.join(dir, "product.md"), 0o000);
+			// An unreadable note and an omitted note coexist here. Admitted one at a
+			// time they each fit budgets that cannot hold both.
+			for (let maxChars = 1; maxChars <= 400; maxChars++) {
+				const decisions = readSharpshooterDecisions(fx.context, now, maxChars);
+				const size = decisions.lines.reduce((sum, line) => sum + line.length + 1, 0);
+				expect(size).toBeLessThanOrEqual(maxChars);
+			}
+			chmodSync(path.join(dir, "product.md"), 0o600);
+		} finally { close(fx); }
+	});
+
+	it("says so when the bank path is redirected rather than staying silent", async () => {
+		const fx = fixture();
+		try {
+			const bank = decide(fx, { "architecture.md": "- Real rule." });
+			const elsewhere = path.join(fx.root, "elsewhere-quiet");
+			mkdirSync(elsewhere, { recursive: true });
+			rmSync(bank, { recursive: true, force: true });
+			symlinkSync(elsewhere, bank);
+			const context = await start(fx);
+			expect(context).toContain("SHARPSHOOTER BANK REDIRECTED");
+		} finally { close(fx); }
+	});
+
+	it("bounds the read by its own buffer, not by the size the stat saw", () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			writeFileSync(path.join(dir, "product.md"), "x".repeat(128 * 1024 + 512));
+			const decisions = readSharpshooterDecisions(fx.context, now);
+			expect(decisions.unreadable).toBe(1);
+			expect(decisions.lines.join("\n")).not.toContain("xxxxxxxxxx");
+		} finally { close(fx); }
+	});
+
+	it("reads nothing when the bank directory itself is redirected", async () => {
+		const fx = fixture();
+		try {
+			const real = decide(fx, { "architecture.md": "- Real rule." });
+			const elsewhere = path.join(fx.root, "elsewhere");
+			mkdirSync(elsewhere, { recursive: true });
+			writeFileSync(path.join(elsewhere, "architecture.md"), "- PLANTED RULE.");
+			rmSync(real, { recursive: true, force: true });
+			symlinkSync(elsewhere, real);
+			const context = await start(fx);
+			expect(context).not.toContain("PLANTED RULE");
+			expect(context).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("reports a decision file it cannot read instead of dropping it", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule.", "product.md": "- Another rule." });
+			chmodSync(path.join(dir, "product.md"), 0o000);
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).toContain("SHARPSHOOTER FILES UNREADABLE: count=1");
+			chmodSync(path.join(dir, "product.md"), 0o600);
+		} finally { close(fx); }
+	});
+
+	it("keeps the store at its own budget when the decisions do not fit", async () => {
+		const fx = fixture();
+		try {
+			for (let index = 0; index < 40; index++) add(fx, `f${index}`, `# Fact ${index}\n${"body ".repeat(50)}`, { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			await start(fx);
+			const baseline = await start(fx);
+			decide(fx, { "architecture.md": `- ${"rule ".repeat(80)}` });
+			// Granted less than the block costs: the block is left out, and the store
+			// must not absorb the leftover reserve as extra room.
+			const partial = await start(fx, 6200);
+			expect(partial).not.toContain("PROJECT DECISIONS");
+			expect(partial.length).toBeLessThanOrEqual(baseline.length);
+		} finally { close(fx); }
+	});
+
+	it("never follows a symlink planted among the decision files", async () => {
+		const fx = fixture();
+		try {
+			const dir = decide(fx, { "architecture.md": "- One rule." });
+			const secret = path.join(fx.root, "secret.txt");
+			writeFileSync(secret, "SHOULD-NEVER-REACH-THE-AGENT");
+			symlinkSync(secret, path.join(dir, "style.md"));
+			const context = await start(fx);
+			expect(context).toContain("- One rule.");
+			expect(context).not.toContain("SHOULD-NEVER-REACH-THE-AGENT");
+			expect(context).not.toContain("## style");
+		} finally { close(fx); }
+	});
+
+	it("reports the omission rather than a heading when no decision file fits", async () => {
+		const fx = fixture();
+		try {
+			// OMP caps each file at 120 lines, so three full files all exceed the block budget.
+			const big = (label: string): string => Array.from({ length: 120 }, (_, index) => `- ${label} rule ${index} ${"x".repeat(40)}`).join("\n");
+			decide(fx, { "architecture.md": big("a"), "product.md": big("p"), "style.md": big("s") });
+			const context = await start(fx);
+			expect(context).toContain("SHARPSHOOTER FILES OMITTED: count=3");
+			// A heading over no rules states nothing, so it is not emitted.
+			expect(context).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("shows the decision files that fit and counts the ones that do not", async () => {
+		const fx = fixture();
+		try {
+			const big = (label: string): string => Array.from({ length: 120 }, (_, index) => `- ${label} rule ${index} ${"x".repeat(40)}`).join("\n");
+			decide(fx, { "architecture.md": "- One small rule.", "product.md": big("p"), "style.md": big("s") });
+			const context = await start(fx);
+			expect(context).toContain("PROJECT DECISIONS");
+			expect(context).toContain("- One small rule.");
+			expect(context).toContain("SHARPSHOOTER FILES OMITTED: count=2");
+			expect(context).not.toContain("p rule 0");
+		} finally { close(fx); }
+	});
+
+	it("never lets the decisions take room the store's tiers already had", async () => {
+		const fx = fixture();
+		try {
+			for (let index = 0; index < 40; index++) add(fx, `f${index}`, `# Fact ${index}\n${"body ".repeat(50)}`, { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			await start(fx);
+			const before = await start(fx);
+			decide(fx, { "architecture.md": "- One rule." });
+			const after = await start(fx);
+			const titles = (value: string): number => value.split("\n").filter(line => line.startsWith("- ") && !line.startsWith("- One rule")).length;
+			expect(titles(after)).toBe(titles(before));
+			expect(after.length).toBeGreaterThan(before.length);
+		} finally { close(fx); }
+	});
+
+	it("drops project decisions before memory rows when the budget is tight", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "handoff", "yesterday's handoff", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			decide(fx, { "architecture.md": `- ${"rule ".repeat(60)}` });
+			const roomy = await start(fx);
+			expect(roomy).toContain("PROJECT DECISIONS");
+			const tight = await start(fx, 500);
+			expect(tight).toContain("yesterday's handoff");
+			expect(tight).not.toContain("PROJECT DECISIONS");
+		} finally { close(fx); }
+	});
+
+	it("accounts for every admitted row while decisions are injected", async () => {
+		const fx = fixture();
+		try {
+			for (let index = 0; index < 30; index++) add(fx, `f${index}`, `# Fact ${index}\n${"body ".repeat(20)}`, { kind: "fact", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			add(fx, "handoff", "yesterday's handoff", { kind: "handoff", cwd: fx.root }, "2026-09-09T00:00:00.000Z");
+			decide(fx, { "architecture.md": "- One rule.", "product.md": "- Another rule." });
+			await start(fx);
+			for (let maxChars = 300; maxChars <= 7000; maxChars += 137) {
+				const context = await start(fx, maxChars);
+				const lines = context.split("\n");
+				const full = lines.filter(line => line.startsWith("[bank=")).length;
+				const titled = lines.filter(line => line.startsWith("- ") && !line.includes(" rule.")).length;
+				const footer = lines.find(line => line.startsWith("+") && line.includes("more not listed"));
+				const counted = footer ? Number(footer.slice(1).split(" ")[0]) : 0;
+				const marker = lines.find(line => line.includes("TRUNCATED: "));
+				const truncated = marker ? Number(marker.split("TRUNCATED: ")[1]?.split(" ")[0]) : 0;
+				expect(full + titled + counted + truncated).toBe(31);
+				expect(context.length).toBeLessThanOrEqual(maxChars);
+			}
 		} finally { close(fx); }
 	});
 });

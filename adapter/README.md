@@ -54,6 +54,11 @@ keeps durable global preferences, corrections, and identities regardless of
 age (excluding only future-dated ones), reports project rows it omits for the
 window, and backs off failed review sweeps with bounded exponential retry.
 Callback selection uses the concrete project path.
+Startup also reads OMP's sharpshooter decision files for the project and injects
+them above the memory index, labeled with the age of the last consolidation.
+That block is capped at 6,000 characters and granted its room on top of the
+store's budget, so it costs the memory tiers nothing; a file past the cap is
+left out whole and counted. The adapter never writes to that directory.
 
 `context` is read-only and resolves OMP global/project settings, the native
 bank scope, exact DB path, and the OMP embedding model. `mcp` and `call` set
