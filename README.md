@@ -56,6 +56,17 @@ window or carry an unparseable timestamp, startup reports the count in its
 untrusted context diagnostics; callback recall is selected against the
 concrete project path rather than synthetic startup wording.
 
+Startup also reads OMP's sharpshooter decision files for the project, when OMP
+has written any, and injects them above the memory index. Sharpshooter distills
+friction-gated project decisions into `architecture.md`, `product.md`, and
+`style.md` under `<agentDir>/memories/sharpshooter/<bank>/`, keyed by the same
+project bank id mnemopi uses. The adapter never writes there: OMP owns those
+files and rewrites all three in full on each consolidation. The block is labeled
+with the age of the last consolidation, capped at 6,000 characters, and granted
+that room on top of the store's own budget, so the decisions cost the memory
+tiers nothing. A file past the cap is left out whole and counted, and a project
+OMP has never opened gets the same context it got before.
+
 The installer is opt-in and never grants blanket hook trust:
 
 ```sh
