@@ -15,6 +15,14 @@ function argValue(args: readonly string[], key: string): string | undefined {
 	return index >= 0 ? args[index + 1] : undefined;
 }
 
+/** `--host` with no value is an error: reading it as "no host" would turn the harness gate off. */
+function hostArg(args: readonly string[]): string | undefined {
+	if (!args.includes("--host")) return undefined;
+	const value = argValue(args, "--host");
+	if (!value || value.startsWith("--")) throw new Error("--host needs a harness name (claude, omp, codex)");
+	return value;
+}
+
 function cwdArg(args: readonly string[]): string {
 	const value = argValue(args, "--cwd") ?? process.cwd();
 	if (!path.isAbsolute(value)) throw new Error(`--cwd must be absolute: ${value}`);
@@ -138,7 +146,7 @@ async function main(argv: readonly string[]): Promise<void> {
 			const cwd = hookCwd(argv.slice(1), input);
 			const context = contextForCwd(cwd);
 			configureRuntime(context);
-			printJson(await sessionStart(cwd));
+			printJson(await sessionStart(cwd, { harness: hostArg(argv.slice(1)) }));
 		} catch (error) {
 			printJson(startupError(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;

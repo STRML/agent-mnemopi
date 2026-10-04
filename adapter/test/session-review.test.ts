@@ -1175,3 +1175,48 @@ describe("SessionStart sharpshooter decisions", () => {
 		} finally { close(fx); }
 	});
 });
+
+describe("SessionStart harness gate", () => {
+	const now = new Date("2026-09-10T00:00:00.000Z");
+	const seed = (fx: Fixture): void => {
+		add(fx, "untagged", "untagged shared rule", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
+		add(fx, "omp-only", "omp tagged rule", { kind: "preference", harness: "omp" }, "2026-09-10T00:00:00.000Z");
+		add(fx, "claude-only", "claude tagged rule", { kind: "preference", harness: "claude" }, "2026-09-10T00:00:00.000Z");
+	};
+
+	it("hides rows tagged for another harness and keeps untagged rows", async () => {
+		const fx = fixture();
+		try {
+			seed(fx);
+			const context = (await sessionStart(fx.root, { context: fx.context, now, harness: "claude" })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("untagged shared rule");
+			expect(context).toContain("claude tagged rule");
+			expect(context).not.toContain("omp tagged rule");
+		} finally { close(fx); }
+	});
+
+	it("applies the same gate to rows the recall callback returns", async () => {
+		const fx = fixture();
+		try {
+			const rows = [
+				{ id: "cb-omp", content: "callback omp rule", metadata: { cwd: fx.root, harness: "omp", kind: "preference" } },
+				{ id: "cb-plain", content: "callback untagged rule", metadata: { cwd: fx.root, kind: "preference" } },
+			];
+			const recall = (): unknown => rows;
+			const claude = (await sessionStart(fx.root, { context: fx.context, now, harness: "claude", recall })).hookSpecificOutput.additionalContext;
+			expect(claude).not.toContain("callback omp rule");
+			const omp = (await sessionStart(fx.root, { context: fx.context, now, harness: "omp", recall })).hookSpecificOutput.additionalContext;
+			expect(omp).toContain("callback omp rule");
+		} finally { close(fx); }
+	});
+
+	it("admits every row when the caller names no harness", async () => {
+		const fx = fixture();
+		try {
+			seed(fx);
+			const context = (await sessionStart(fx.root, { context: fx.context, now })).hookSpecificOutput.additionalContext;
+			expect(context).toContain("omp tagged rule");
+			expect(context).toContain("claude tagged rule");
+		} finally { close(fx); }
+	});
+});

@@ -76,6 +76,8 @@ export interface SessionStartOptions {
 	readonly recall?: (bank: string, context: AdapterContext) => Promise<unknown> | unknown;
 	readonly now?: Date | (() => Date);
 	readonly maxChars?: number;
+	/** Calling harness (`--host`). Rows whose metadata names a different harness are not admitted. */
+	readonly harness?: string;
 }
 
 export interface SessionStartOutput {
@@ -197,6 +199,12 @@ function kindOf(metadata: Record<string, unknown>, row: RawRow): string {
 	return text(metadata.kind || row.memory_type).trim().toLowerCase();
 }
 
+/** A row tagged for one harness stays out of the others; untagged rows and callers that name no harness see everything. */
+function taggedForOther(metadata: Record<string, unknown>, harness: string | undefined): boolean {
+	const tagged = text(metadata.harness).trim();
+	return Boolean(harness && tagged && tagged !== harness);
+}
+
 type Verdict = "admit" | "omit_window" | "reject";
 
 interface Admission {
@@ -207,12 +215,13 @@ interface Admission {
 }
 
 /** Decide one row from its phase-1 decision columns. */
-function admission(row: RawRow, bank: string, globalBank: string, projectRoot: string, now: Date): Admission {
+function admission(row: RawRow, bank: string, globalBank: string, projectRoot: string, now: Date, harness: string | undefined): Admission {
 	const metadata = parseMetadata(row.metadata_json);
 	const kind = kindOf(metadata, row);
 	const taskKey = text(metadata.task_key || metadata.taskKey).trim();
 	const decided = (verdict: Verdict): Admission => ({ verdict, metadata, kind, taskKey });
 	if (text(row.superseded_by).trim()) return decided("reject");
+	if (taggedForOther(metadata, harness)) return decided("reject");
 	// A missing timestamp, including a table with no timestamp column, reads as
 	// "": global rows keep it, and project rows fail the window and are counted.
 	const timestamp = text(row.timestamp);
@@ -273,7 +282,7 @@ function tableColumns(db: Database, table: string): Set<string> {
 }
 
 /** Two-phase read of one table: decide on decision columns, then load detail for admitted rows. */
-function readTable(db: Database, table: string, bank: string, globalBank: string, projectRoot: string, now: Date): { rows: StartupMemory[]; omitted: number; contentless: number } {
+function readTable(db: Database, table: string, bank: string, globalBank: string, projectRoot: string, now: Date, harness: string | undefined): { rows: StartupMemory[]; omitted: number; contentless: number } {
 	const columns = tableColumns(db, table);
 	const pick = (names: readonly string[]): string => names.filter(name => columns.has(name)).join(", ");
 	// Ordered by id only: startup sorts by parsed time in JS, so SQL never interprets a timestamp.
@@ -283,7 +292,7 @@ function readTable(db: Database, table: string, bank: string, globalBank: string
 	let omitted = 0;
 	let contentless = 0;
 	for (const row of candidates) {
-		const decision = admission(row, bank, globalBank, projectRoot, now);
+		const decision = admission(row, bank, globalBank, projectRoot, now, harness);
 		if (decision.verdict === "omit_window") omitted += 1;
 		if (decision.verdict !== "admit") continue;
 		// Inside the read snapshot every phase-1 row is still present in phase 2; a
@@ -296,7 +305,7 @@ function readTable(db: Database, table: string, bank: string, globalBank: string
 	return { rows, omitted, contentless };
 }
 
-function readBank(bank: string, dbPath: string, globalBank: string, projectRoot: string, now: Date, canonical: boolean): BankRead {
+function readBank(bank: string, dbPath: string, globalBank: string, projectRoot: string, now: Date, canonical: boolean, harness: string | undefined): BankRead {
 	if (!existsSync(dbPath)) return canonical
 		? { bank, dbPath, rows: [], error: "store_missing" }
 		: { bank, dbPath, rows: [] };
@@ -314,7 +323,7 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 				const notes: string[] = [];
 				let contentless = 0;
 				for (const table of ["working_memory", "episodic_memory"] as const) {
-					const read = readTable(db, table, bank, globalBank, projectRoot, now);
+					const read = readTable(db, table, bank, globalBank, projectRoot, now, harness);
 					rows.push(...read.rows);
 					contentless += read.contentless;
 					if (read.omitted > 0) notes.push(`STARTUP PROJECT ROWS OMITTED: bank=${bank} table=${table} count=${read.omitted}; outside the ${STARTUP_LOOKBACK_DAYS}-day timestamp window or timestamp is invalid`);
@@ -329,13 +338,14 @@ function readBank(bank: string, dbPath: string, globalBank: string, projectRoot:
 	}
 }
 
-function callbackRows(value: unknown, bank: string, now: Date): StartupMemory[] {
+function callbackRows(value: unknown, bank: string, now: Date, harness: string | undefined): StartupMemory[] {
 	const envelope = value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 	const candidates = Array.isArray(value) ? value : Array.isArray(envelope.results) ? envelope.results : [];
 	return candidates.flatMap(candidate => {
 		if (candidate === null || typeof candidate !== "object") return [];
 		const row = candidate as RawRow;
 		const metadata = parseMetadata(row.metadata_json ?? row.metadata);
+		if (taggedForOther(metadata, harness)) return [];
 		const id = text(row.id || row.memory_id);
 		const content = text(row.content);
 		if (!id || !content) return [];
@@ -697,7 +707,7 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	let contentless = 0;
 	const allRows: StartupMemory[] = [];
 	for (const bank of banks) {
-		const read = readBank(bank, dbPathForBank(context, bank), context.globalBank, projectRoot, now, bank === context.baseBank);
+		const read = readBank(bank, dbPathForBank(context, bank), context.globalBank, projectRoot, now, bank === context.baseBank, options.harness);
 		reads.push(read);
 		if (read.error) errors.push(`${read.error} bank=${bank} dbPath=${read.dbPath} configFiles=${context.configFiles.join(",") || "(none)"}`);
 		readNotes.push(...(read.notes ?? []));
@@ -705,13 +715,13 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 		allRows.push(...read.rows);
 		if (options.recall && !read.error) {
 			try {
-				const recalled = callbackRows(await options.recall(bank, context), bank, now);
+				const recalled = callbackRows(await options.recall(bank, context), bank, now, options.harness);
 				// Packet A's selector owns the evidence policy for recalled rows; the
 				// direct store read above stays metadata-qualified and deterministic.
 				const selector = options.selectInjectableRecall ?? policySelectInjectableRecall;
 				if (selector) {
 					const selected = selector(projectRoot, recalled as unknown as RecallCandidate[]);
-					allRows.push(...callbackRows(selected, bank, now));
+					allRows.push(...callbackRows(selected, bank, now, options.harness));
 				}
 			} catch (error) {
 				errors.push(`partial startup recall failure bank=${bank}: ${String(error)}`);

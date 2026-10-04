@@ -23,6 +23,13 @@ describe("entrypoint hook contract", () => {
 		expect(payload.systemMessage).toBeString();
 	});
 
+	it("fails startup on a bare --host instead of dropping the harness gate", async () => {
+		const result = await run(["startup", "--host"], JSON.stringify({ cwd: repoRoot }), {});
+		expect(result.code).toBe(1);
+		const payload = JSON.parse(result.out) as Record<string, unknown>;
+		expect(payload.systemMessage).toContain("--host needs a harness name");
+	});
+
 	it("reports a missing fixture store through a valid startup response", async () => {
 		const root = mkdtempSync(path.join(tmpdir(), "mnemopi-entry-hook-"));
 		const agent = path.join(root, "agent");
