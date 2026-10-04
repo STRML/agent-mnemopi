@@ -138,7 +138,7 @@ async function main(argv: readonly string[]): Promise<void> {
 			const cwd = hookCwd(argv.slice(1), input);
 			const context = contextForCwd(cwd);
 			configureRuntime(context);
-			printJson(await sessionStart(cwd));
+			printJson(await sessionStart(cwd, { harness: argValue(argv.slice(1), "--host") }));
 		} catch (error) {
 			printJson(startupError(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;
