@@ -1195,6 +1195,21 @@ describe("SessionStart harness gate", () => {
 		} finally { close(fx); }
 	});
 
+	it("applies the same gate to rows the recall callback returns", async () => {
+		const fx = fixture();
+		try {
+			const rows = [
+				{ id: "cb-omp", content: "callback omp rule", metadata: { cwd: fx.root, harness: "omp", kind: "preference" } },
+				{ id: "cb-plain", content: "callback untagged rule", metadata: { cwd: fx.root, kind: "preference" } },
+			];
+			const recall = (): unknown => rows;
+			const claude = (await sessionStart(fx.root, { context: fx.context, now, harness: "claude", recall })).hookSpecificOutput.additionalContext;
+			expect(claude).not.toContain("callback omp rule");
+			const omp = (await sessionStart(fx.root, { context: fx.context, now, harness: "omp", recall })).hookSpecificOutput.additionalContext;
+			expect(omp).toContain("callback omp rule");
+		} finally { close(fx); }
+	});
+
 	it("admits every row when the caller names no harness", async () => {
 		const fx = fixture();
 		try {
