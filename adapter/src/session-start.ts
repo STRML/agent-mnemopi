@@ -1,21 +1,17 @@
 import { Database } from "bun:sqlite";
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { contextForCwd, type AdapterContext } from "./context";
 import { resolveBankDbPath } from "./reliability/bank-path";
 import { selectInjectableRecall as policySelectInjectableRecall, type RecallCandidate } from "./reliability/policy";
-import { reviewDue, type ReviewResult } from "./review";
+import { ensurePrivateDir, reviewDue } from "./review";
+import { readReviewFailure, recordReviewFailure } from "./review-sweep";
 import { readSharpshooterDecisions, SHARPSHOOTER_RESERVE_CHARS } from "./sharpshooter";
 
 // The store's own budget. A project with sharpshooter decisions adds what that
 // block actually costs, so the decisions take none of the room the store's tiers
 // already had, and a project without them sees exactly this.
 const STARTUP_LIMIT = 6000;
-const REVIEW_TIMEOUT_MS = 2000;
-const REVIEW_FAILURE_FILE = "review-failure.json";
-const REVIEW_RETRY_BASE_MS = 60_000;
-const REVIEW_RETRY_MAX_MS = 3_600_000;
 const STALE_DAYS = 30;
 // Startup context is a bounded bootstrap, not a historical export. Project
 // rows need a timestamp JS can parse inside this window; global curated rows
@@ -78,6 +74,7 @@ export interface SessionStartOptions {
 	readonly maxChars?: number;
 	/** Calling harness (`--host`). Rows whose metadata names a different harness are not admitted. */
 	readonly harness?: string;
+	readonly launchReviewSweep?: (cwd: string) => Promise<{ started: boolean; error?: string }>;
 }
 
 export interface SessionStartOutput {
@@ -108,13 +105,6 @@ interface RawRow {
 	valid_until?: unknown;
 	superseded_by?: unknown;
 	[key: string]: unknown;
-}
-
-interface ReviewFailureState {
-	readonly attempts: number;
-	readonly failedAt: string;
-	readonly retryAt: string;
-	readonly error?: string;
 }
 
 function nowValue(value: SessionStartOptions["now"]): Date {
@@ -572,123 +562,47 @@ function formatContext(rows: readonly StartupMemory[], notes: readonly string[],
 	return fitLines(lines, maxChars);
 }
 
-function reviewDueStatus(context: AdapterContext, now: Date, dueDays = 7): string {
-	const dir = path.join(context.dataDir, ".adapter-review");
-	let latest: string | undefined;
-	try {
-		if (existsSync(dir) && lstatSync(dir).isSymbolicLink()) return `REVIEW STATUS: due (snapshot directory is symlinked; due_days=${dueDays})`;
-		for (const name of readdirSync(dir).filter(value => value.startsWith("snapshot-") && value.endsWith(".json")).sort()) {
-			try {
-				const parsed: unknown = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
-				const completedAt = parsed !== null && typeof parsed === "object" ? (parsed as { completedAt?: unknown }).completedAt : undefined;
-				if (typeof completedAt === "string" && (!latest || completedAt > latest)) latest = completedAt;
-			} catch {
-				// Ignore a partial/old snapshot and keep looking for the last successful one.
-			}
-		}
-	} catch {
-		// Missing private review directory means first run.
+async function scheduleReview(context: AdapterContext, now: Date, options: SessionStartOptions, errors: string[]): Promise<string> {
+	const due = reviewDue(context.cwd, 7, { context, now });
+	const reason = due.ageDays === undefined ? "no successful snapshot" : `age_days=${due.ageDays.toFixed(1)} due_days=7`;
+	const note = `REVIEW STATUS: ${due.status} (${reason})`;
+	if (due.status !== "due") return note;
+	const failure = readReviewFailure(context);
+	if (failure && Date.parse(failure.retryAt) > now.getTime()) {
+		return `REVIEW STATUS: due (retry deferred after failed sweep; retry_at=${failure.retryAt} attempts=${failure.attempts} last_error=${(failure.error ?? "unknown error").slice(0, 120)})`;
 	}
-	if (!latest) return `REVIEW STATUS: due (no successful snapshot; due_days=${dueDays})`;
-	const timestamp = Date.parse(latest);
-	if (!Number.isFinite(timestamp)) return `REVIEW STATUS: due (invalid last snapshot timestamp; due_days=${dueDays})`;
-	const age = Math.max(0, (now.getTime() - timestamp) / 86_400_000);
-	return age >= dueDays ? `REVIEW STATUS: due (age_days=${age.toFixed(1)} due_days=${dueDays})` : `REVIEW STATUS: not_due (age_days=${age.toFixed(1)} due_days=${dueDays})`;
+	if (errors.length > 0 || !options.launchReviewSweep) return note;
+	return launchSweep(context, now, options.launchReviewSweep, errors, note);
 }
 
-function reviewFailurePath(context: AdapterContext): string {
-	return path.join(context.dataDir, ".adapter-review", REVIEW_FAILURE_FILE);
-}
-
-function readReviewFailure(context: AdapterContext): ReviewFailureState | undefined {
+function reviewDirProblem(context: AdapterContext): string | undefined {
 	try {
-		const file = reviewFailurePath(context);
-		const info = lstatSync(file);
-		if (!info.isFile() || (typeof process.getuid === "function" && info.uid !== process.getuid()) || (info.mode & 0o077) !== 0) return undefined;
-		const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-		const state = parsed as Partial<ReviewFailureState>;
-		if (!Number.isInteger(state.attempts) || state.attempts < 1 || typeof state.failedAt !== "string" || typeof state.retryAt !== "string") return undefined;
-		if (!Number.isFinite(Date.parse(state.failedAt)) || !Number.isFinite(Date.parse(state.retryAt))) return undefined;
-		return { attempts: state.attempts, failedAt: state.failedAt, retryAt: state.retryAt, ...(typeof state.error === "string" ? { error: state.error } : {}) };
-	} catch {
+		ensurePrivateDir(path.join(context.dataDir, ".adapter-review"));
 		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
 	}
 }
 
-function retryDelayMs(attempts: number): number {
-	return Math.min(REVIEW_RETRY_MAX_MS, REVIEW_RETRY_BASE_MS * 2 ** Math.min(10, Math.max(0, attempts - 1)));
-}
-
-function recordReviewFailure(context: AdapterContext, now: Date, error: string): ReviewFailureState | undefined {
+async function launchSweep(context: AdapterContext, now: Date, launcher: NonNullable<SessionStartOptions["launchReviewSweep"]>, errors: string[], note: string): Promise<string> {
+	// A worker could neither review nor record a backoff in an unusable directory,
+	// so every start would spawn another one. Say so here instead.
+	const unusable = reviewDirProblem(context);
+	if (unusable) {
+		errors.push(`review sweep not started: ${unusable}`);
+		return `${note}; sweep not started`;
+	}
+	let launch: { started: boolean; error?: string };
 	try {
-		const directory = path.dirname(reviewFailurePath(context));
-		mkdirSync(directory, { recursive: true, mode: 0o700 });
-		const existing = readReviewFailure(context);
-		const attempts = (existing?.attempts ?? 0) + 1;
-		const failedAt = now.toISOString();
-		const state: ReviewFailureState = {
-			attempts,
-			failedAt,
-			retryAt: new Date(now.getTime() + retryDelayMs(attempts)).toISOString(),
-			error: error.slice(0, 1000),
-		};
-		const target = reviewFailurePath(context);
-		const temporary = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-		writeFileSync(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
-		chmodSync(temporary, 0o600);
-		renameSync(temporary, target);
-		return state;
-	} catch {
-		return undefined;
+		launch = await launcher(context.cwd);
+	} catch (error) {
+		launch = { started: false, error: String(error) };
 	}
-}
-
-function clearReviewFailure(context: AdapterContext): void {
-	try { unlinkSync(reviewFailurePath(context)); } catch { /* no marker or best effort */ }
-}
-
-async function boundedReview(context: AdapterContext, now: Date, dueDays: number): Promise<ReviewResult | { status: "timeout"; error: string }> {
-	const reviewDir = path.join(context.dataDir, ".adapter-review");
-	const before = new Set<string>();
-	try { for (const name of readdirSync(reviewDir)) before.add(name); } catch { /* first run */ }
-	const reviewModule = existsSync(path.join(import.meta.dir, "review.ts"))
-		? path.join(import.meta.dir, "review.ts")
-		: path.join(import.meta.dir, "..", "src", "review.ts");
-	const reviewModuleUrl = existsSync(reviewModule) ? pathToFileURL(reviewModule).href : undefined;
-	const workerSource = [
-		`const input = JSON.parse(await new Response(Bun.stdin.stream()).text());`,
-		`if (input.reviewModule) { const { review } = await import(input.reviewModule); const result = review(input.cwd, input.dueDays, { context: JSON.parse(input.contextJson), now: new Date(input.now), timeoutMs: input.timeoutMs, stageSnapshot: true }); process.stdout.write(JSON.stringify(result)); }`,
-		`else { const child = Bun.spawn([process.execPath, input.entryPath, "review", "--cwd", input.cwd, "--due-days", String(input.dueDays)], { stdout: "pipe", stderr: "pipe", env: { ...process.env, MNEMOPI_REVIEW_STAGE: "1" } }); const [out] = await Promise.all([new Response(child.stdout).text(), child.exited]); process.stdout.write(out); }`,
-	].join("\n");
-	const child = Bun.spawn([process.execPath, "-e", workerSource], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-	child.stdin.write(JSON.stringify({ cwd: context.cwd, dueDays, now: now.toISOString(), timeoutMs: REVIEW_TIMEOUT_MS - 100, contextJson: JSON.stringify(context), reviewModule: reviewModuleUrl, entryPath: Bun.main }));
-	child.stdin.end();
-	let timedOut = false;
-	const timer = setTimeout(() => { timedOut = true; child.kill(); }, REVIEW_TIMEOUT_MS);
-	const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	clearTimeout(timer);
-	if (timedOut || exitCode !== 0) {
-		try {
-			for (const name of readdirSync(reviewDir)) if (!before.has(name) && name.startsWith("snapshot-")) unlinkSync(path.join(reviewDir, name));
-		} catch { /* preserve prior snapshots even if cleanup cannot complete */ }
-		return { status: "timeout", error: timedOut ? `review timeout after ${REVIEW_TIMEOUT_MS}ms` : `review worker exited ${exitCode}` };
-	}
-	try {
-		const result = JSON.parse(stdout) as ReviewResult;
-		if (result.status === "ok" && result.snapshotPath?.includes(`${path.sep}.stage-`)) {
-			const staged = result.snapshotPath;
-			const stagedInfo = lstatSync(staged);
-			if (stagedInfo.isSymbolicLink() || !stagedInfo.isFile() || (typeof process.getuid === "function" && stagedInfo.uid !== process.getuid()) || (stagedInfo.mode & 0o077) !== 0 || path.dirname(staged) !== reviewDir) throw new Error("invalid staged snapshot path");
-			const published = path.join(reviewDir, `snapshot-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-			renameSync(staged, published);
-			chmodSync(published, 0o600);
-			const dirFd = openSync(reviewDir, "r");
-			try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-			return { ...result, snapshotPath: published };
-		}
-		return result;
-	} catch (error) { return { status: "timeout", error: `review worker returned invalid or unpublished result: ${String(error)}` }; }
+	if (launch.started) return `${note}; sweep started in background`;
+	const error = launch.error ?? "unknown launch error";
+	recordReviewFailure(context, now, error);
+	errors.push(`review sweep could not start: ${error}`);
+	return `${note}; sweep could not start`;
 }
 
 function contextOrThrow(cwd: string, options: SessionStartOptions): AdapterContext {
@@ -744,33 +658,7 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	// limit rather than absorbing the leftover reserve.
 	const decisionBudget = requested - STARTUP_LIMIT >= decisionCost ? decisionCost : 0;
 	const effectiveMax = Math.min(requested, STARTUP_LIMIT + decisionBudget);
-	let reviewNote = reviewDueStatus(context, now);
-	const due = reviewDue(context.cwd, 7, { context, now });
-	if (due.status === "due") {
-		const failure = readReviewFailure(context);
-		const retryAt = failure ? Date.parse(failure.retryAt) : Number.NaN;
-		if (failure && Number.isFinite(retryAt) && retryAt > now.getTime()) {
-			reviewNote = `REVIEW STATUS: due (retry deferred after failed sweep; retry_at=${failure.retryAt} attempts=${failure.attempts})`;
-		} else {
-			const sweep = await boundedReview(context, now, 7);
-			if (sweep.status === "timeout") {
-				const recorded = recordReviewFailure(context, now, sweep.error);
-				errors.push(`${sweep.error}; no automatic completion claim`);
-				reviewNote = recorded
-					? `REVIEW STATUS: due (bounded sweep failed; retry_at=${recorded.retryAt}; prior snapshot retained)`
-					: `REVIEW STATUS: due (bounded sweep failed; prior snapshot retained)`;
-			} else if (sweep.status !== "ok") {
-				const recorded = recordReviewFailure(context, now, sweep.error ?? "unknown error");
-				errors.push(`review sweep failed: ${sweep.error ?? "unknown error"}`);
-				reviewNote = recorded
-					? `REVIEW STATUS: due (sweep failed; retry_at=${recorded.retryAt}; prior snapshot retained)`
-					: `REVIEW STATUS: due (sweep failed; prior snapshot retained)`;
-			} else {
-				clearReviewFailure(context);
-				reviewNote = `REVIEW STATUS: sweep completed (added=${sweep.report.added.length} changed=${sweep.report.changed.length} missing=${sweep.report.missing.length} stale=${sweep.report.stale.length} duplicate=${sweep.report.duplicates.length} expired=${sweep.report.expired.length} superseded=${sweep.report.superseded.length} unresolved_imports=${sweep.report.unresolvedImports.length})`;
-			}
-		}
-	}
+	const reviewNote = await scheduleReview(context, now, options, errors);
 	const systemMessage = errors.length > 0
 		? `Mnemopi SessionStart warning: ${errors.join("; ")}. Memory recall did not silently succeed.`
 		: undefined;

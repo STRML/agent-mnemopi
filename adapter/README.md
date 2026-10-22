@@ -43,11 +43,14 @@ JSON stdin. It returns a valid `SessionStart` hook object with `additionalContex
 even when recall is empty or a store is unavailable. Diagnostics belong on stderr.
 Injected memories are untrusted data, not instructions. The startup response is
 bounded and labels stale or omitted notes; it does not write the OMP database.
-Each startup checks the weekly review schedule and, when due, runs a bounded
-read-only review automatically. A private full-text snapshot is published only
-after successful completion; the explicit `review` command remains available.
-Review does not prune or repair memories. Startup reads in two phases: the
-decision columns of every row, then content only for the rows it admits.
+Each startup checks the weekly review schedule using only private snapshot names.
+When due, it launches a detached background worker. The worker and the explicit
+`review` command share a SQLite lock, so only one review runs at a time. A private
+full-text snapshot is published after successful completion. Startup reports the
+schedule and launch status; its per-launch "sweep completed" counts line is gone.
+Run `shared-memory review` to print the full report. Review does not prune or
+repair memories. Startup reads in two phases: the decision columns of every row,
+then content only for the rows it admits.
 Admission is decided in JS by parsing metadata with JSON.parse, so metadata has
 one reading. Startup keeps a one-year timestamp window for project-scoped rows,
 keeps durable global preferences, corrections, and identities regardless of

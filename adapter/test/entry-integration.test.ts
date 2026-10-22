@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -55,6 +57,75 @@ describe("entrypoint hook contract", () => {
 			expect(JSON.parse(result.out).status).toBe("error");
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
+});
+
+describe("background review sweep", () => {
+	function collect(stream: NodeJS.ReadableStream): Promise<string> {
+		return new Promise((resolve, reject) => {
+			let text = "";
+			stream.on("data", chunk => { text += String(chunk); });
+			stream.on("end", () => resolve(text));
+			stream.on("error", reject);
+		});
+	}
+
+	function waitForLockFree(lockPath: string): void {
+		const probe = new Database(lockPath, { create: true });
+		try {
+			probe.exec("PRAGMA busy_timeout = 30000");
+			probe.exec("BEGIN EXCLUSIVE");
+			probe.exec("ROLLBACK");
+		} finally { probe.close(); }
+	}
+
+	function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+		return Promise.race([promise, Bun.sleep(ms).then(() => { throw new Error(`${what} did not finish within ${ms}ms`); })]);
+	}
+
+	it("returns from the startup hook while the sweep waits, and the sweep outlives the hook's process group", async () => {
+		const root = mkdtempSync(path.join(tmpdir(), "mnemopi-entry-sweep-"));
+		const agent = path.join(root, "agent");
+		const data = path.join(root, "data");
+		const reviewDir = path.join(data, ".adapter-review");
+		const lockPath = path.join(reviewDir, "review.lock");
+		const snapshots = (): string[] => readdirSync(reviewDir).filter(name => name.startsWith("snapshot-") && name.endsWith(".json"));
+		mkdirSync(agent, { recursive: true });
+		mkdirSync(reviewDir, { recursive: true, mode: 0o700 });
+		writeFileSync(path.join(agent, "config.yml"), ["mnemopi:", `  dbPath: ${path.join(data, "mnemopi.db")}`, "  scoping: global", "  noEmbeddings: true", ""].join("\n"));
+		const store = new Database(path.join(data, "mnemopi.db"), { create: true });
+		store.exec("CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT, metadata_json TEXT, memory_type TEXT); CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, timestamp TEXT, metadata_json TEXT);");
+		store.close();
+		// Barrier: the worker waits on this lock, so the hook is checked while its sweep is still pending.
+		const barrier = new Database(lockPath, { create: true });
+		barrier.exec("BEGIN EXCLUSIVE");
+		let released = false;
+		const release = (): void => { if (released) return; released = true; barrier.exec("ROLLBACK"); barrier.close(); };
+		try {
+			const hook = spawn(process.execPath, [bundle, "startup", "--host", "claude"], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: agent }, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+			hook.stdin.end(`${JSON.stringify({ cwd: root, source: "fixture" })}\n`);
+			const exited = new Promise<number | null>(resolve => hook.on("exit", code => resolve(code)));
+			// Claude Code waits for the hook's stdout to close; a worker holding it open would block here.
+			const [out, err, code] = await within(Promise.all([collect(hook.stdout), collect(hook.stderr), exited]), 5000, "startup hook");
+			expect(code).toBe(0);
+			expect(err).toBe("");
+			expect(JSON.parse(out).hookSpecificOutput.additionalContext).toContain("sweep started in background");
+			expect(snapshots()).toEqual([]);
+			// A host that kills the hook's process group must not take the sweep with it.
+			try { process.kill(-(hook.pid as number), "SIGKILL"); } catch { /* the group is already empty */ }
+			release();
+			const deadline = Date.now() + 20_000;
+			while (snapshots().length === 0 && Date.now() < deadline) await Bun.sleep(100);
+			expect(snapshots().length).toBe(1);
+			waitForLockFree(lockPath);
+			// The worker's attempt record is cleared once the sweep succeeds.
+			expect(existsSync(path.join(reviewDir, "review-failure.json"))).toBe(false);
+		} finally {
+			release();
+			// Reap on every path, assertion failures included, before the fixture is removed.
+			waitForLockFree(lockPath);
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 60_000);
 });
 
 describe("portable hook installer", () => {

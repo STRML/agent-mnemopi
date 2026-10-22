@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { review, reviewDue } from "../src/review";
+import { runLockedReview, type LockedReviewResult } from "../src/review-sweep";
 import { sessionStart, startupDbPath } from "../src/session-start";
 import { readSharpshooterDecisions, sharpshooterBankDir } from "../src/sharpshooter";
 import { projectBankSegment } from "../src/vendor/omp-config";
@@ -58,6 +59,76 @@ function add(fx: Fixture, id: string, content: string, metadata: Record<string, 
 	fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json, memory_type, valid_until) VALUES (?, ?, ?, ?, ?, ?, ?)", [id, content, "test", timestamp, JSON.stringify(metadata), metadata.kind ?? null, validUntil ?? null]);
 }
 
+const SWEEP_NOW = new Date("2026-09-10T00:00:00.000Z");
+
+function reviewDirOf(fx: Fixture): string {
+	return path.join(fx.context.dataDir, ".adapter-review");
+}
+
+function snapshotNames(fx: Fixture): string[] {
+	try { return readdirSync(reviewDirOf(fx)).filter(name => name.startsWith("snapshot-") && name.endsWith(".json")).sort(); } catch { return []; }
+}
+
+function leftovers(fx: Fixture): string[] {
+	try { return readdirSync(reviewDirOf(fx)).filter(name => name.startsWith(".stage-") || name.includes(".tmp-")).sort(); } catch { return []; }
+}
+
+function validSnapshotBody(completedAt: string): string {
+	return JSON.stringify({ completedAt, rows: [] });
+}
+
+/** Writes a private snapshot named the way writeSnapshot names one. */
+function plantSnapshot(fx: Fixture, completedAt: Date, body: string): string {
+	mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+	const name = `snapshot-${completedAt.getTime()}-fixture.json`;
+	writeFileSync(path.join(reviewDirOf(fx), name), body, { mode: 0o600 });
+	return name;
+}
+
+function plantFailure(fx: Fixture, state: { attempts: number; failedAt: string; retryAt: string; error: string }): void {
+	mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+	writeFileSync(path.join(reviewDirOf(fx), "review-failure.json"), JSON.stringify(state), { mode: 0o600 });
+}
+
+function readFailure(fx: Fixture): { attempts: number; retryAt: string; error?: string } | undefined {
+	const file = path.join(reviewDirOf(fx), "review-failure.json");
+	return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) as { attempts: number; retryAt: string; error?: string } : undefined;
+}
+
+/** Holds the sweep lock from this process, the way a running sweep would. */
+function holdLock(fx: Fixture): Database {
+	mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+	const lock = new Database(path.join(reviewDirOf(fx), "review.lock"), { create: true });
+	lock.exec("PRAGMA busy_timeout = 0");
+	lock.exec("BEGIN EXCLUSIVE");
+	return lock;
+}
+
+function releaseLock(lock: Database): void {
+	lock.exec("ROLLBACK");
+	lock.close();
+}
+
+function lockIsFree(fx: Fixture): boolean {
+	try { releaseLock(holdLock(fx)); return true; } catch { return false; }
+}
+
+/** Holds the lock from another process; resolves once it is held. */
+async function holdLockInChild(fx: Fixture, holdMs: number): Promise<ReturnType<typeof Bun.spawn>> {
+	mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+	const source = `const { Database } = await import("bun:sqlite"); const lock = new Database(${JSON.stringify(path.join(reviewDirOf(fx), "review.lock"))}, { create: true }); lock.exec("BEGIN EXCLUSIVE"); console.log("held"); await Bun.sleep(${holdMs});`;
+	const child = Bun.spawn([process.execPath, "-e", source], { stdout: "pipe", stderr: "pipe" });
+	const reader = child.stdout.getReader();
+	let seen = "";
+	while (!seen.includes("held")) {
+		const { value, done } = await reader.read();
+		if (done) throw new Error("lock holder exited before holding the lock");
+		seen += new TextDecoder().decode(value);
+	}
+	reader.releaseLock();
+	return child;
+}
+
 describe("SessionStart bounded metadata recall", () => {
 	it("keeps project-bank paths in the data directory banks namespace", () => {
 		const fx = fixture();
@@ -98,9 +169,9 @@ describe("SessionStart bounded metadata recall", () => {
 			expect(output.hookSpecificOutput.additionalContext).not.toContain("outside project startup lookback");
 			expect(output.hookSpecificOutput.additionalContext).toContain("STARTUP PROJECT ROWS OMITTED");
 			expect(output.hookSpecificOutput.additionalContext).not.toContain("not valid at startup time");
-			expect(output.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: sweep completed");
-			expect(readdirSync(path.join(fx.context.dataDir, ".adapter-review")).some(name => name.startsWith("snapshot-"))).toBe(true);
-			expect(readdirSync(path.join(fx.context.dataDir, ".adapter-review")).some(name => name.startsWith(".stage-"))).toBe(false);
+			// Without a launcher the hook only reports the schedule; it never reviews inline.
+			expect(output.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (no successful snapshot");
+			expect(snapshotNames(fx)).toEqual([]);
 		} finally { close(fx); }
 	});
 
@@ -447,16 +518,25 @@ describe("SessionStart bounded metadata recall", () => {
 	it("backs off repeated failed review sweeps without creating a successful snapshot", async () => {
 		const fx = fixture();
 		try {
-			fx.db.exec("DROP TABLE episodic_memory");
 			const now = new Date("2026-09-10T00:00:00.000Z");
-			const first = await sessionStart(fx.root, { context: fx.context, now });
-			expect(first.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (sweep failed");
+			// Stand-in for the detached worker: run the locked sweep in this process. The
+			// failure is in the snapshot write, so the startup read itself stays healthy.
+			const launches: LockedReviewResult[] = [];
+			const launchReviewSweep = async () => {
+				launches.push(runLockedReview(fx.context, { mode: "sweep", now, waitMs: 0, snapshotWriter: () => { throw new Error("simulated snapshot write failure"); } }));
+				return { started: true as const };
+			};
+			const first = await sessionStart(fx.root, { context: fx.context, now, launchReviewSweep });
+			expect(first.hookSpecificOutput.additionalContext).toContain("sweep started in background");
+			expect(launches.map(result => result.status)).toEqual(["error"]);
 			const reviewDir = path.join(fx.context.dataDir, ".adapter-review");
-			expect(readdirSync(reviewDir).filter(name => name.startsWith("snapshot-")).length).toBe(0);
+			expect(snapshotNames(fx)).toEqual([]);
 
-			const second = await sessionStart(fx.root, { context: fx.context, now });
+			const second = await sessionStart(fx.root, { context: fx.context, now, launchReviewSweep });
 			expect(second.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (retry deferred");
-			expect(readdirSync(reviewDir).filter(name => name.startsWith("snapshot-")).length).toBe(0);
+			expect(second.hookSpecificOutput.additionalContext).toContain("last_error=Error: simulated snapshot write failure");
+			expect(launches.length).toBe(1);
+			expect(snapshotNames(fx)).toEqual([]);
 			const failure = JSON.parse(readFileSync(path.join(reviewDir, "review-failure.json"), "utf8")) as { attempts: number; retryAt: string };
 			expect(failure.attempts).toBe(1);
 			expect(Date.parse(failure.retryAt)).toBeGreaterThan(now.getTime());
@@ -788,28 +868,23 @@ describe("non-destructive review snapshots", () => {
 		} finally { close(fx); }
 	});
 
-	it("does not timestamp a snapshot when the bounded sweep times out", () => {
+	it("reads due status from snapshot names without opening the files", () => {
 		const fx = fixture();
 		try {
-			add(fx, "one", "stable", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
-			const first = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") });
-			const previousPath = first.snapshotPath as string;
-			const timedOut = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-11T00:00:00.000Z"), timeoutMs: -1 });
-			expect(timedOut.status).toBe("error");
-			expect(timedOut.error).toContain("review_timeout");
-			expect(timedOut.previousSnapshotPath).toBe(previousPath);
-			expect(readdirSync(path.join(fx.context.dataDir, ".adapter-review")).filter(name => name.startsWith("snapshot-")).length).toBe(1);
+			// The rename is the commit point, so a visible name is a finished file.
+			// A body that would not parse proves the check never read it.
+			plantSnapshot(fx, new Date("2026-09-09T00:00:00.000Z"), "{not json");
+			const due = reviewDue(fx.root, 7, { context: fx.context, now: SWEEP_NOW });
+			expect(due.status).toBe("not_due");
+			expect(due.lastSuccessfulSnapshotAt).toBe("2026-09-09T00:00:00.000Z");
 		} finally { close(fx); }
 	});
 
-	it("publishes staged snapshots only through the successful review path", () => {
+	it("ignores a snapshot name stamped far in the future", () => {
 		const fx = fixture();
 		try {
-			add(fx, "one", "staged", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
-			const staged = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z"), stageSnapshot: true });
-			expect(staged.status).toBe("ok");
-			expect(path.basename(staged.snapshotPath as string)).toMatch(/^\.stage-/);
-			expect(reviewDue(fx.root, 7, { context: fx.context, now: new Date("2026-09-11T00:00:00.000Z") }).status).toBe("due");
+			plantSnapshot(fx, new Date("2027-09-10T00:00:00.000Z"), validSnapshotBody("2027-09-10T00:00:00.000Z"));
+			expect(reviewDue(fx.root, 7, { context: fx.context, now: SWEEP_NOW }).status).toBe("due");
 		} finally { close(fx); }
 	});
 
@@ -1217,6 +1292,258 @@ describe("SessionStart harness gate", () => {
 			const context = (await sessionStart(fx.root, { context: fx.context, now })).hookSpecificOutput.additionalContext;
 			expect(context).toContain("omp tagged rule");
 			expect(context).toContain("claude tagged rule");
+		} finally { close(fx); }
+	});
+});
+
+describe("SessionStart review scheduling", () => {
+	function recorder(started = true, error?: string): { calls: string[]; launch: (cwd: string) => Promise<{ started: boolean; error?: string }> } {
+		const calls: string[] = [];
+		return { calls, launch: async cwd => { calls.push(cwd); return started ? { started: true } : { started: false, error }; } };
+	}
+
+	it("launches the sweep in the background and returns without reviewing inline", async () => {
+		const fx = fixture();
+		try {
+			add(fx, "pref", "always use terse output", { kind: "preference" }, "2026-09-09T00:00:00.000Z");
+			const launcher = recorder();
+			const output = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls).toEqual([fx.context.cwd]);
+			expect(output.hookSpecificOutput.additionalContext).toContain("sweep started in background");
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(output.systemMessage).toBeUndefined();
+		} finally { close(fx); }
+	});
+
+	it("does not relaunch while a failed sweep is backing off, and names the last error", async () => {
+		const fx = fixture();
+		try {
+			plantFailure(fx, { attempts: 3, failedAt: "2026-09-09T23:59:00.000Z", retryAt: "2026-09-10T01:00:00.000Z", error: "store_schema_mismatch (expected episodic_memory)" });
+			const launcher = recorder();
+			const context = (await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch })).hookSpecificOutput.additionalContext;
+			expect(launcher.calls).toEqual([]);
+			expect(context).toContain("retry deferred after failed sweep");
+			expect(context).toContain("attempts=3");
+			expect(context).toContain("last_error=store_schema_mismatch");
+		} finally { close(fx); }
+	});
+
+	it("reports not_due from a fresh snapshot name without reading its body", async () => {
+		const fx = fixture();
+		try {
+			plantSnapshot(fx, new Date("2026-09-09T00:00:00.000Z"), "{not json");
+			const launcher = recorder();
+			const context = (await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch })).hookSpecificOutput.additionalContext;
+			expect(launcher.calls).toEqual([]);
+			expect(context).toContain("REVIEW STATUS: not_due");
+		} finally { close(fx); }
+	});
+
+	it("records a launch failure, warns, and backs off instead of retrying every start", async () => {
+		const fx = fixture();
+		try {
+			const launcher = recorder(false, "spawn ENOENT");
+			const first = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(first.systemMessage).toContain("spawn ENOENT");
+			expect(first.hookSpecificOutput.additionalContext).toContain("sweep could not start");
+			expect(readFailure(fx)?.attempts).toBe(1);
+			const second = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls.length).toBe(1);
+			expect(second.hookSpecificOutput.additionalContext).toContain("retry deferred");
+		} finally { close(fx); }
+	});
+
+	it("treats a snapshot stamped far in the future as no snapshot", async () => {
+		const fx = fixture();
+		try {
+			plantSnapshot(fx, new Date("2027-09-10T00:00:00.000Z"), validSnapshotBody("2027-09-10T00:00:00.000Z"));
+			const launcher = recorder();
+			await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls.length).toBe(1);
+		} finally { close(fx); }
+	});
+
+	it("does not launch, and says why, when the review directory is unusable", async () => {
+		const fx = fixture();
+		try {
+			// A worker could neither review nor record a backoff here, so each start would spawn another.
+			const elsewhere = path.join(fx.root, "elsewhere");
+			mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+			symlinkSync(elsewhere, reviewDirOf(fx));
+			const launcher = recorder();
+			const first = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+			expect(first.systemMessage).toContain("symlink");
+			expect(first.hookSpecificOutput.additionalContext).toContain("sweep not started");
+		} finally { close(fx); }
+	});
+
+	it("does not launch a sweep when the startup read could not reach the store", async () => {
+		const fx = fixture(false);
+		try {
+			const launcher = recorder();
+			const output = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+			expect(output.systemMessage).toContain("store_missing");
+			expect(output.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due");
+		} finally { close(fx); }
+	});
+});
+
+describe("locked review sweep", () => {
+	it("publishes a snapshot, clears a stale failure record, and frees the lock", () => {
+		const fx = fixture();
+		try {
+			add(fx, "one", "stable", { kind: "preference" }, "2026-09-09T00:00:00.000Z");
+			plantFailure(fx, { attempts: 2, failedAt: "2026-09-09T20:00:00.000Z", retryAt: "2026-09-09T21:00:00.000Z", error: "old failure" });
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("ok");
+			expect(snapshotNames(fx).length).toBe(1);
+			expect(leftovers(fx)).toEqual([]);
+			expect(readFailure(fx)).toBeUndefined();
+			expect(lockIsFree(fx)).toBe(true);
+		} finally { close(fx); }
+	});
+
+	it("returns busy and writes nothing while another sweep holds the lock", () => {
+		const fx = fixture();
+		const lock = holdLock(fx);
+		try {
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("busy");
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(readFailure(fx)).toBeUndefined();
+		} finally { releaseLock(lock); close(fx); }
+	});
+
+	it("rechecks the schedule under the lock and skips a sweep another worker just finished", () => {
+		const fx = fixture();
+		try {
+			expect(runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 }).status).toBe("ok");
+			const second = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(second.status).toBe("skipped");
+			expect(second.reason).toBe("not_due");
+			expect(snapshotNames(fx).length).toBe(1);
+		} finally { close(fx); }
+	});
+
+	it("skips while a recorded failure is still backing off", () => {
+		const fx = fixture();
+		try {
+			plantFailure(fx, { attempts: 1, failedAt: "2026-09-09T23:59:00.000Z", retryAt: "2026-09-10T00:01:00.000Z", error: "earlier failure" });
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("skipped");
+			expect(result.reason).toBe("deferred");
+			expect(snapshotNames(fx)).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("records a failed review with backoff and leaves no snapshot or temp file", () => {
+		const fx = fixture();
+		try {
+			fx.db.exec("DROP TABLE episodic_memory");
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("error");
+			expect(result.error).toContain("store_schema_mismatch");
+			const failure = readFailure(fx);
+			expect(failure?.attempts).toBe(1);
+			expect(Date.parse(failure?.retryAt ?? "")).toBeGreaterThan(SWEEP_NOW.getTime());
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(leftovers(fx)).toEqual([]);
+			expect(lockIsFree(fx)).toBe(true);
+		} finally { close(fx); }
+	});
+
+	it("removes stage and temp files a dead run left behind, and keeps real snapshots", () => {
+		const fx = fixture();
+		try {
+			const old = plantSnapshot(fx, new Date("2026-08-01T00:00:00.000Z"), validSnapshotBody("2026-08-01T00:00:00.000Z"));
+			for (const name of [".stage-1-a.json", ".stage-2-b.json.tmp-123", "snapshot-3-c.json.tmp-9"]) writeFileSync(path.join(reviewDirOf(fx), name), "orphan", { mode: 0o600 });
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("ok");
+			expect(leftovers(fx)).toEqual([]);
+			expect(snapshotNames(fx)).toContain(old);
+			expect(snapshotNames(fx).length).toBe(2);
+		} finally { close(fx); }
+	});
+
+	it("removes orphans even when the sweep then skips", () => {
+		const fx = fixture();
+		try {
+			plantSnapshot(fx, new Date("2026-09-09T00:00:00.000Z"), validSnapshotBody("2026-09-09T00:00:00.000Z"));
+			writeFileSync(path.join(reviewDirOf(fx), ".stage-1-a.json"), "orphan", { mode: 0o600 });
+			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("skipped");
+			expect(leftovers(fx)).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("records the attempt before reviewing, so a worker that dies mid-run still backs off", () => {
+		const fx = fixture();
+		try {
+			let duringRun: ReturnType<typeof readFailure>;
+			const result = runLockedReview(fx.context, {
+				mode: "sweep",
+				now: SWEEP_NOW,
+				waitMs: 0,
+				snapshotWriter: (directory: string) => {
+					duringRun = readFailure(fx);
+					const target = path.join(directory, `snapshot-${SWEEP_NOW.getTime()}-w9.json`);
+					writeFileSync(target, validSnapshotBody(SWEEP_NOW.toISOString()), { mode: 0o600 });
+					return target;
+				},
+			});
+			expect(duringRun?.attempts).toBe(1);
+			expect(duringRun?.error).toContain("did not finish");
+			expect(Date.parse(duringRun?.retryAt ?? "")).toBeGreaterThan(SWEEP_NOW.getTime());
+			expect(result.status).toBe("ok");
+			expect(readFailure(fx)).toBeUndefined();
+		} finally { close(fx); }
+	});
+
+	it("removes the temp file of a snapshot write that failed partway", () => {
+		const fx = fixture();
+		try {
+			const result = runLockedReview(fx.context, {
+				mode: "sweep",
+				now: SWEEP_NOW,
+				waitMs: 0,
+				snapshotWriter: (directory: string) => {
+					writeFileSync(path.join(directory, `snapshot-${SWEEP_NOW.getTime()}-partial.json.tmp-1`), "partial", { mode: 0o600 });
+					throw new Error("simulated disk full");
+				},
+			});
+			expect(result.status).toBe("error");
+			expect(result.error).toContain("simulated disk full");
+			expect(leftovers(fx)).toEqual([]);
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(readFailure(fx)?.attempts).toBe(1);
+		} finally { close(fx); }
+	});
+
+	it("takes the lock at once after the previous holder was killed", async () => {
+		const fx = fixture();
+		try {
+			const holder = await holdLockInChild(fx, 60_000);
+			holder.kill("SIGKILL");
+			await holder.exited;
+			expect(runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 }).status).toBe("ok");
+		} finally { close(fx); }
+	});
+
+	it("runs an explicit review after waiting for a sweep, even when the review is not due", async () => {
+		const fx = fixture();
+		try {
+			plantSnapshot(fx, new Date("2026-09-09T00:00:00.000Z"), validSnapshotBody("2026-09-09T00:00:00.000Z"));
+			const holder = await holdLockInChild(fx, 800);
+			const started = performance.now();
+			const result = runLockedReview(fx.context, { mode: "explicit", now: SWEEP_NOW, waitMs: 20_000 });
+			await holder.exited;
+			expect(performance.now() - started).toBeGreaterThan(300);
+			expect(result.status).toBe("ok");
+			expect(result.review?.report).toBeDefined();
+			expect(snapshotNames(fx).length).toBe(2);
 		} finally { close(fx); }
 	});
 });

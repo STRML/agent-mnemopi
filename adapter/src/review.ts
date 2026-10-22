@@ -15,9 +15,6 @@ export interface ReviewOptions {
 	readonly writeSnapshot?: boolean;
 	/** Fixture-only seam for proving failed writes preserve the prior snapshot. */
 	readonly snapshotWriter?: (directory: string, completedAt: string, rows: readonly ReviewRow[], journalPath?: string) => string;
-	readonly timeoutMs?: number;
-	/** Internal worker mode: write a private stage file; the parent publishes it after success. */
-	readonly stageSnapshot?: boolean;
 }
 
 export interface ReviewDueResult {
@@ -88,7 +85,7 @@ function snapshotDir(context: AdapterContext): string {
 	return path.join(context.dataDir, SNAPSHOT_DIR);
 }
 
-function ensurePrivateDir(dir: string): void {
+export function ensurePrivateDir(dir: string): void {
 	let root = path.parse(path.resolve(dir)).root;
 	for (const segment of path.resolve(dir).slice(root.length).split(path.sep).filter(Boolean)) {
 		root = path.join(root, segment);
@@ -139,14 +136,20 @@ function loadSnapshot(dir: string): { path?: string; snapshot?: Snapshot } {
 
 function dueCheck(context: AdapterContext, dueDays: number, now: Date): ReviewDueResult {
 	const dir = snapshotDir(context);
-	const last = loadSnapshot(dir);
-	if (!last.snapshot) return { status: "due", dueDays, reason: "no successful snapshot exists", snapshotDir: dir };
-	const timestamp = Date.parse(last.snapshot.completedAt);
-	if (!Number.isFinite(timestamp)) return { status: "due", dueDays, reason: "last snapshot timestamp is invalid", snapshotDir: dir };
+	let timestamp: number | undefined;
+	for (const file of snapshotFiles(dir)) {
+		const match = /^snapshot-(\d+)-[A-Za-z0-9]+\.json$/.exec(path.basename(file));
+		if (!match) continue;
+		const value = Number(match[1]);
+		if (!Number.isFinite(value) || value > now.getTime() + 300_000) continue;
+		if (timestamp === undefined || value > timestamp) timestamp = value;
+	}
+	if (timestamp === undefined) return { status: "due", dueDays, reason: "no successful snapshot exists", snapshotDir: dir };
+	const lastSuccessfulSnapshotAt = new Date(timestamp).toISOString();
 	const age = Math.max(0, (now.getTime() - timestamp) / 86_400_000);
 	return age >= dueDays
-		? { status: "due", dueDays, lastSuccessfulSnapshotAt: last.snapshot.completedAt, ageDays: age, reason: `snapshot age ${age.toFixed(1)} days is at least ${dueDays}`, snapshotDir: dir }
-		: { status: "not_due", dueDays, lastSuccessfulSnapshotAt: last.snapshot.completedAt, ageDays: age, reason: `snapshot age ${age.toFixed(1)} days is below ${dueDays}`, snapshotDir: dir };
+		? { status: "due", dueDays, lastSuccessfulSnapshotAt, ageDays: age, reason: `snapshot age ${age.toFixed(1)} days is at least ${dueDays}`, snapshotDir: dir }
+		: { status: "not_due", dueDays, lastSuccessfulSnapshotAt, ageDays: age, reason: `snapshot age ${age.toFixed(1)} days is below ${dueDays}`, snapshotDir: dir };
 }
 
 function rowHash(row: Record<string, unknown>): string {
@@ -253,9 +256,9 @@ function journalGaps(context: AdapterContext): { path?: string; gaps: JournalGap
 	return { path: journalPath, gaps, memoryKeys };
 }
 
-function writeSnapshot(dir: string, completedAt: string, rows: readonly ReviewRow[], journalPath?: string, prefix = SNAPSHOT_PREFIX): string {
+function writeSnapshot(dir: string, completedAt: string, rows: readonly ReviewRow[], journalPath?: string): string {
 	ensurePrivateDir(dir);
-	const name = `${prefix}${Date.parse(completedAt)}-${Math.random().toString(36).slice(2)}.json`;
+	const name = `${SNAPSHOT_PREFIX}${Date.parse(completedAt)}-${Math.random().toString(36).slice(2)}.json`;
 	const target = path.join(dir, name);
 	const temporary = `${target}.tmp-${process.pid}`;
 	const snapshot: Snapshot = { completedAt, rows, ...(journalPath ? { journalPath } : {}) };
@@ -264,9 +267,11 @@ function writeSnapshot(dir: string, completedAt: string, rows: readonly ReviewRo
 	const fileFd = openSync(temporary, "r");
 	try { fsyncSync(fileFd); } finally { closeSync(fileFd); }
 	renameSync(temporary, target);
-	chmodSync(target, 0o600);
-	const dirFd = openSync(dir, "r");
-	try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+	try {
+		chmodSync(target, 0o600);
+		const dirFd = openSync(dir, "r");
+		try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+	} catch { /* The rename already committed the private snapshot. */ }
 	return target;
 }
 
@@ -300,7 +305,6 @@ export function reviewDue(cwd: string, dueDays = 7, options: ReviewOptions = {})
 export function review(cwd: string, dueDays = 7, options: ReviewOptions = {}): ReviewResult {
 	const context = options.context ?? contextForCwd(path.resolve(cwd));
 	const now = nowValue(options.now);
-	const startedAt = Date.now();
 	const due = dueCheck(context, Math.max(1, dueDays), now);
 	const banks = dedupeBanks(context);
 	const previous = loadSnapshot(snapshotDir(context));
@@ -344,11 +348,9 @@ export function review(cwd: string, dueDays = 7, options: ReviewOptions = {}): R
 			journalGaps: journal.gaps,
 			nativeCoverage: "Adapter journal is not universal; native OMP and external writes appear as unjournaled snapshot changes.",
 		};
-		if (options.timeoutMs !== undefined && Date.now() - startedAt > options.timeoutMs) throw new Error(`review_timeout after ${Date.now() - startedAt}ms`);
 		const shouldWrite = options.writeSnapshot !== false;
-		const stageSnapshot = options.stageSnapshot === true || process.env.MNEMOPI_REVIEW_STAGE === "1";
 		const snapshotPath = shouldWrite
-			? (options.snapshotWriter ?? ((dir, completedAt, rows, journalPath) => writeSnapshot(dir, completedAt, rows, journalPath, stageSnapshot ? ".stage-" : SNAPSHOT_PREFIX)))(snapshotDir(context), now.toISOString(), current, journal.path)
+			? (options.snapshotWriter ?? writeSnapshot)(snapshotDir(context), now.toISOString(), current, journal.path)
 			: undefined;
 		return { status: "ok", due, snapshotPath, previousSnapshotPath: previous.path, report };
 	} catch (error) {
