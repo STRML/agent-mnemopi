@@ -127,6 +127,13 @@ The migration writes through the vendored `BeamMemory.importFromDict` source;
 it does not depend on a transient generated `engine.js` bundle. The generated
 adapter bundle is a reproducible build artifact and is intentionally ignored.
 
+`patches/mnemopi-unix-embedding-url.patch` records a second vendored change:
+`core/embeddings.ts` accepts a `unix:<path>` value for `MNEMOPI_EMBEDDING_API_URL`
+and sends the embeddings request over that socket. It lets the adapter share one
+embedding model through `mnemopi embed-serve --socket` (oh-my-pi PR 13785)
+instead of loading its own ONNX runtime per process. Plain `http(s)` URLs behave
+as before. `adapter/test/unix-embedding-url.test.ts` covers it.
+
 ## Reliability limits
 
 The adapter exposes explicit memory tools; it does not automatically inject a

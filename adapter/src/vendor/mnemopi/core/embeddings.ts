@@ -424,8 +424,18 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 	}
 }
 
+/** A `unix:<path>` API URL addresses an `embed-serve --socket` server on a local socket. */
+const UNIX_URL_SCHEME = "unix:";
+
+/** Where `POST /embeddings` goes: a plain URL, or a fixed host over the socket named by a `unix:` URL. */
+function embeddingsEndpoint(baseUrl: string): { url: string; unix?: string } {
+	if (!baseUrl.startsWith(UNIX_URL_SCHEME)) return { url: `${baseUrl.replace(/\/+$/, "")}/embeddings` };
+	return { url: "http://localhost/v1/embeddings", unix: baseUrl.slice(UNIX_URL_SCHEME.length) };
+}
+
 async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
 	const baseUrl = embeddingBaseUrl();
+	const endpoint = embeddingsEndpoint(baseUrl);
 	const isCustom = !hostMatchesUrl(baseUrl, "openrouter");
 	const apiKey = embeddingApiKey();
 	if (!isCustom && !embeddingKeyConfigured(apiKey)) {
@@ -446,13 +456,14 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 			if (key !== "") {
 				headers.Authorization = `Bearer ${key}`;
 			}
-			const res = await fetchWithRetry(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
+			const res = await fetchWithRetry(endpoint.url, {
 				method: "POST",
 				headers,
 				body,
 				signal: AbortSignal.timeout(30000),
 				maxAttempts: 3,
 				defaultDelayMs: attempt => 2 ** attempt * 1000,
+				...(endpoint.unix === undefined ? {} : { unix: endpoint.unix }),
 			});
 			if (res.status === 401) {
 				throw new ProviderHttpError("mnemopi embedding request unauthorized (401)", 401, { headers: res.headers });
