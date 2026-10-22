@@ -1,12 +1,12 @@
 import * as path from "node:path";
 import { contextForCwd, type AdapterContext } from "./context";
-import { review } from "./review";
+import { launchReviewSweep, recordReviewFailure, runLockedReview, type LockedReviewResult } from "./review-sweep";
 import { sessionStart } from "./session-start";
 import { runMcpServer } from "./vendor/mnemopi/mcp-server";
 import { handleToolCall } from "./vendor/mnemopi/mcp-tools";
 
 function usage(): never {
-	console.error("usage: shared-memory <mcp|context|call TOOL JSON|session-start|startup|review> [--cwd ABS]");
+	console.error("usage: shared-memory <mcp|context|call TOOL JSON|session-start|startup|review|review-sweep> [--cwd ABS]");
 	process.exit(2);
 }
 
@@ -106,6 +106,25 @@ function printJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function sweepSummary(result: LockedReviewResult): Record<string, unknown> {
+	const report = result.review?.report;
+	const counts = report ? Object.fromEntries(Object.entries(report).flatMap(([key, value]) => Array.isArray(value) ? [[key, value.length]] : [])) : undefined;
+	return { status: result.status, reason: result.reason, error: result.error, snapshotPath: result.review?.snapshotPath, ...(counts ? { report: counts } : {}) };
+}
+
+function runReviewSweep(context: AdapterContext): void {
+	try {
+		const result = runLockedReview(context, { mode: "sweep" });
+		printJson(sweepSummary(result));
+		if (result.status === "error") process.exitCode = 1;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		recordReviewFailure(context, new Date(), message);
+		printJson({ status: "error", error: message });
+		process.exitCode = 1;
+	}
+}
+
 async function main(argv: readonly string[]): Promise<void> {
 	const mode = argv[0];
 	if (!mode) usage();
@@ -146,20 +165,26 @@ async function main(argv: readonly string[]): Promise<void> {
 			const cwd = hookCwd(argv.slice(1), input);
 			const context = contextForCwd(cwd);
 			configureRuntime(context);
-			printJson(await sessionStart(cwd, { harness: hostArg(argv.slice(1)) }));
+			printJson(await sessionStart(cwd, { harness: hostArg(argv.slice(1)), launchReviewSweep }));
 		} catch (error) {
 			printJson(startupError(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;
 		}
 		return;
 	}
+	if (mode === "review-sweep") {
+		const context = contextForCwd(cwdArg(argv.slice(1)));
+		configureRuntime(context);
+		runReviewSweep(context);
+		return;
+	}
 	if (mode === "review") {
 		const cwd = cwdArg(argv.slice(1));
 		const context = contextForCwd(cwd);
 		configureRuntime(context);
-		const result = await review(cwd, dueDaysArg(argv.slice(1)));
-		printJson(result);
-		if (result.status === "error") process.exitCode = 1;
+		const result = runLockedReview(context, { mode: "explicit", dueDays: dueDaysArg(argv.slice(1)) });
+		printJson(result.review ?? { status: result.status, error: result.error });
+		if (result.status !== "ok") process.exitCode = 1;
 		return;
 	}
 	usage();
