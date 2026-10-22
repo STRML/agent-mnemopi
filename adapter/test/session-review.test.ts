@@ -1363,6 +1363,22 @@ describe("SessionStart review scheduling", () => {
 		} finally { close(fx); }
 	});
 
+	it("does not launch, and says why, when the review directory is unusable", async () => {
+		const fx = fixture();
+		try {
+			// A worker could neither review nor record a backoff here, so each start would spawn another.
+			const elsewhere = path.join(fx.root, "elsewhere");
+			mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+			symlinkSync(elsewhere, reviewDirOf(fx));
+			const launcher = recorder();
+			const first = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+			expect(first.systemMessage).toContain("symlink");
+			expect(first.hookSpecificOutput.additionalContext).toContain("sweep not started");
+		} finally { close(fx); }
+	});
+
 	it("does not launch a sweep when the startup read could not reach the store", async () => {
 		const fx = fixture(false);
 		try {

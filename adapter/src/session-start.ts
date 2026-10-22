@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { contextForCwd, type AdapterContext } from "./context";
 import { resolveBankDbPath } from "./reliability/bank-path";
 import { selectInjectableRecall as policySelectInjectableRecall, type RecallCandidate } from "./reliability/policy";
-import { reviewDue } from "./review";
+import { ensurePrivateDir, reviewDue } from "./review";
 import { readReviewFailure, recordReviewFailure } from "./review-sweep";
 import { readSharpshooterDecisions, SHARPSHOOTER_RESERVE_CHARS } from "./sharpshooter";
 
@@ -572,9 +572,29 @@ async function scheduleReview(context: AdapterContext, now: Date, options: Sessi
 		return `REVIEW STATUS: due (retry deferred after failed sweep; retry_at=${failure.retryAt} attempts=${failure.attempts} last_error=${(failure.error ?? "unknown error").slice(0, 120)})`;
 	}
 	if (errors.length > 0 || !options.launchReviewSweep) return note;
+	return launchSweep(context, now, options.launchReviewSweep, errors, note);
+}
+
+function reviewDirProblem(context: AdapterContext): string | undefined {
+	try {
+		ensurePrivateDir(path.join(context.dataDir, ".adapter-review"));
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
+async function launchSweep(context: AdapterContext, now: Date, launcher: NonNullable<SessionStartOptions["launchReviewSweep"]>, errors: string[], note: string): Promise<string> {
+	// A worker could neither review nor record a backoff in an unusable directory,
+	// so every start would spawn another one. Say so here instead.
+	const unusable = reviewDirProblem(context);
+	if (unusable) {
+		errors.push(`review sweep not started: ${unusable}`);
+		return `${note}; sweep not started`;
+	}
 	let launch: { started: boolean; error?: string };
 	try {
-		launch = await options.launchReviewSweep(context.cwd);
+		launch = await launcher(context.cwd);
 	} catch (error) {
 		launch = { started: false, error: String(error) };
 	}
