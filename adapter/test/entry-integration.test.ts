@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { installChangeLog } from "../src/changelog";
 
 const repoRoot = path.resolve(import.meta.dir, "../..");
 const bundle = process.env.ADAPTER_BUNDLE?.trim() || path.join(repoRoot, "adapter", "dist", "shared-memory.js");
@@ -59,6 +60,84 @@ describe("entrypoint hook contract", () => {
 	});
 });
 
+describe("changelog-install command", () => {
+	it("installs the log into every bank and prints counts as JSON", async () => {
+		const root = mkdtempSync(path.join(tmpdir(), "mnemopi-entry-changelog-"));
+		const agent = path.join(root, "agent");
+		mkdirSync(agent, { recursive: true });
+		const schema = "CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT, metadata_json TEXT); CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, timestamp TEXT, metadata_json TEXT);";
+		for (const dir of [path.join(root, "data"), path.join(root, "data", "banks", "other")]) {
+			mkdirSync(dir, { recursive: true });
+			const db = new Database(path.join(dir, "mnemopi.db"));
+			db.exec(schema);
+			db.close();
+		}
+		writeFileSync(path.join(agent, "config.yml"), ["mnemopi:", `  dbPath: ${path.join(root, "data", "mnemopi.db")}`, "  scoping: global", "  noEmbeddings: true", ""].join("\n"));
+		try {
+			const first = await run(["changelog-install", "--cwd", root], undefined, { PI_CODING_AGENT_DIR: agent });
+			expect(first.code).toBe(0);
+			const summary = JSON.parse(first.out) as { installed: string[]; present: string[]; busy: string[]; failed: unknown[] };
+			expect(summary.installed.sort()).toEqual(["default", "other"]);
+			expect(summary.present).toEqual([]);
+			expect(summary.busy).toEqual([]);
+			expect(summary.failed).toEqual([]);
+			const second = JSON.parse((await run(["changelog-install", "--cwd", root], undefined, { PI_CODING_AGENT_DIR: agent })).out) as { present: string[] };
+			expect(second.present.sort()).toEqual(["default", "other"]);
+			expect(existsSync(path.join(root, "data", ".adapter-review", "changelog-install-failure.json"))).toBe(false);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("skips banks still backing off and keeps their failure record", async () => {
+		const root = mkdtempSync(path.join(tmpdir(), "mnemopi-entry-changelog-skip-"));
+		const agent = path.join(root, "agent");
+		mkdirSync(agent, { recursive: true });
+		const good = "CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT, metadata_json TEXT); CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, timestamp TEXT, metadata_json TEXT);";
+		for (const [dir, schema] of [[path.join(root, "data"), good], [path.join(root, "data", "banks", "other"), "CREATE TABLE unrelated (id TEXT)"]] as const) {
+			mkdirSync(dir, { recursive: true });
+			const db = new Database(path.join(dir, "mnemopi.db"));
+			db.exec(schema);
+			db.close();
+		}
+		const reviewDir = path.join(root, "data", ".adapter-review");
+		mkdirSync(reviewDir, { recursive: true, mode: 0o700 });
+		const retryAt = new Date(Date.now() + 1_800_000).toISOString();
+		writeFileSync(path.join(reviewDir, "changelog-install-failure.json"), JSON.stringify({ failedAt: new Date().toISOString(), error: "other: store_schema_mismatch", banks: { other: retryAt } }), { mode: 0o600 });
+		writeFileSync(path.join(agent, "config.yml"), ["mnemopi:", `  dbPath: ${path.join(root, "data", "mnemopi.db")}`, "  scoping: global", "  noEmbeddings: true", ""].join("\n"));
+		try {
+			const result = await run(["changelog-install", "--from-startup", "--cwd", root], undefined, { PI_CODING_AGENT_DIR: agent });
+			expect(result.code).toBe(0);
+			const summary = JSON.parse(result.out) as { installed: string[]; skipped: string[]; failed: unknown[] };
+			expect(summary.installed).toEqual(["default"]);
+			expect(summary.skipped).toEqual(["other"]);
+			expect(summary.failed).toEqual([]);
+			const record = JSON.parse(readFileSync(path.join(reviewDir, "changelog-install-failure.json"), "utf8")) as { banks: Record<string, string> };
+			expect(record.banks).toEqual({ other: retryAt });
+			const manual = JSON.parse((await run(["changelog-install", "--cwd", root], undefined, { PI_CODING_AGENT_DIR: agent })).out) as { skipped: string[]; failed: { bank: string }[] };
+			expect(manual.skipped).toEqual([]);
+			expect(manual.failed.map(entry => entry.bank)).toEqual(["other"]);
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("records a failed install so startup backs off, and exits non-zero", async () => {
+		const root = mkdtempSync(path.join(tmpdir(), "mnemopi-entry-changelog-fail-"));
+		const agent = path.join(root, "agent");
+		mkdirSync(agent, { recursive: true });
+		mkdirSync(path.join(root, "data"), { recursive: true });
+		const db = new Database(path.join(root, "data", "mnemopi.db"));
+		db.exec("CREATE TABLE unrelated (id TEXT)");
+		db.close();
+		writeFileSync(path.join(agent, "config.yml"), ["mnemopi:", `  dbPath: ${path.join(root, "data", "mnemopi.db")}`, "  scoping: global", "  noEmbeddings: true", ""].join("\n"));
+		try {
+			const result = await run(["changelog-install", "--cwd", root], undefined, { PI_CODING_AGENT_DIR: agent });
+			expect(result.code).toBe(1);
+			expect(JSON.parse(result.out).failed.map((entry: { bank: string }) => entry.bank)).toEqual(["default"]);
+			const record = JSON.parse(readFileSync(path.join(root, "data", ".adapter-review", "changelog-install-failure.json"), "utf8")) as { banks: Record<string, string> };
+			expect(Object.keys(record.banks)).toEqual(["default"]);
+			expect(Date.parse(record.banks.default)).toBeGreaterThan(Date.now());
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+});
+
 describe("background review sweep", () => {
 	function collect(stream: NodeJS.ReadableStream): Promise<string> {
 		return new Promise((resolve, reject) => {
@@ -88,13 +167,15 @@ describe("background review sweep", () => {
 		const data = path.join(root, "data");
 		const reviewDir = path.join(data, ".adapter-review");
 		const lockPath = path.join(reviewDir, "review.lock");
-		const snapshots = (): string[] => readdirSync(reviewDir).filter(name => name.startsWith("snapshot-") && name.endsWith(".json"));
+		const snapshots = (): string[] => readdirSync(reviewDir).filter(name => name.startsWith("marker-") && name.endsWith(".json"));
 		mkdirSync(agent, { recursive: true });
 		mkdirSync(reviewDir, { recursive: true, mode: 0o700 });
 		writeFileSync(path.join(agent, "config.yml"), ["mnemopi:", `  dbPath: ${path.join(data, "mnemopi.db")}`, "  scoping: global", "  noEmbeddings: true", ""].join("\n"));
 		const store = new Database(path.join(data, "mnemopi.db"), { create: true });
 		store.exec("CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT, metadata_json TEXT, memory_type TEXT); CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, timestamp TEXT, metadata_json TEXT);");
 		store.close();
+		// With the log already present, startup launches only the sweep, not a detached install.
+		installChangeLog(path.join(data, "mnemopi.db"));
 		// Barrier: the worker waits on this lock, so the hook is checked while its sweep is still pending.
 		const barrier = new Database(lockPath, { create: true });
 		barrier.exec("BEGIN EXCLUSIVE");

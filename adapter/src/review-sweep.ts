@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { installChangeLogAll, recordInstallOutcome, type ChangeLogInstallSummary } from "./changelog-install";
 import type { AdapterContext } from "./context";
 import { ensurePrivateDir, review, reviewDue, type ReviewOptions, type ReviewResult } from "./review";
 
@@ -21,7 +22,7 @@ export interface LockedReviewOptions {
 	readonly now?: Date;
 	readonly waitMs?: number;
 	readonly dueDays?: number;
-	readonly snapshotWriter?: ReviewOptions["snapshotWriter"];
+	readonly markerWriter?: ReviewOptions["markerWriter"];
 }
 
 export interface LockedReviewResult {
@@ -29,6 +30,8 @@ export interface LockedReviewResult {
 	readonly reason?: "not_due" | "deferred";
 	readonly error?: string;
 	readonly review?: ReviewResult;
+	/** Change-log install run just before the review, so new banks are logged. */
+	readonly install?: ChangeLogInstallSummary;
 }
 
 function reviewFailurePath(context: AdapterContext): string {
@@ -87,7 +90,7 @@ export function clearReviewFailure(context: AdapterContext): void {
 
 function removeOrphans(directory: string): void {
 	for (const name of readdirSync(directory)) {
-		if (name.startsWith(".stage-") || (name.startsWith("snapshot-") && name.includes(".tmp-"))) unlinkSync(path.join(directory, name));
+		if (name.startsWith(".stage-") || name.includes(".tmp-")) unlinkSync(path.join(directory, name));
 	}
 }
 
@@ -107,10 +110,12 @@ function performReview(context: AdapterContext, options: LockedReviewOptions, no
 		: undefined;
 	if (options.mode === "sweep" && !attempt) return { status: "error", error: "could not record review sweep attempt" };
 	try {
-		const result = review(context.cwd, dueDays, { context, now, snapshotWriter: options.snapshotWriter });
+		const install = installChangeLogAll(context);
+		recordInstallOutcome(context, install, now);
+		const result = review(context.cwd, dueDays, { context, now, markerWriter: options.markerWriter });
 		if (result.status === "ok") clearReviewFailure(context);
 		else if (attempt) writeReviewFailure(context, { ...attempt, error: (result.error ?? "unknown error").slice(0, 1000) });
-		return { status: result.status, ...(result.error ? { error: result.error } : {}), review: result };
+		return { status: result.status, ...(result.error ? { error: result.error } : {}), review: result, install };
 	} catch (error) {
 		if (attempt) writeReviewFailure(context, { ...attempt, error: String(error).slice(0, 1000) });
 		return { status: "error", error: String(error) };
@@ -146,12 +151,13 @@ export function runLockedReview(context: AdapterContext, options: LockedReviewOp
 	}
 }
 
-export function launchReviewSweep(cwd: string): Promise<{ started: boolean; error?: string }> {
+export function launchDetached(mode: "review-sweep" | "changelog-install", cwd: string): Promise<{ started: boolean; error?: string }> {
 	return new Promise(resolve => {
 		try {
 			const sourceEntry = path.join(import.meta.dir, "entry.ts");
 			const entry = existsSync(sourceEntry) ? sourceEntry : Bun.main;
-			const child = spawn(process.execPath, [entry, "review-sweep", "--cwd", cwd], { detached: true, stdio: "ignore" });
+			const args = mode === "changelog-install" ? [entry, mode, "--from-startup", "--cwd", cwd] : [entry, mode, "--cwd", cwd];
+			const child = spawn(process.execPath, args, { detached: true, stdio: "ignore" });
 			child.once("spawn", () => resolve({ started: true }));
 			child.once("error", error => resolve({ started: false, error: String(error) }));
 			child.unref();
@@ -159,4 +165,12 @@ export function launchReviewSweep(cwd: string): Promise<{ started: boolean; erro
 			resolve({ started: false, error: String(error) });
 		}
 	});
+}
+
+export function launchReviewSweep(cwd: string): Promise<{ started: boolean; error?: string }> {
+	return launchDetached("review-sweep", cwd);
+}
+
+export function launchChangeLogInstall(cwd: string): Promise<{ started: boolean; error?: string }> {
+	return launchDetached("changelog-install", cwd);
 }

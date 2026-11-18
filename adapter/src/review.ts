@@ -1,20 +1,30 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { pruneChanges, readChanges, readLogState, TRACKED_COLUMNS, type ChangeEntry } from "./changelog";
 import { contextForCwd, type AdapterContext } from "./context";
 import { resolveBankDbPath } from "./reliability/bank-path";
 import { journalPath as configuredJournalPath } from "./reliability/journal";
 
 const SNAPSHOT_DIR = ".adapter-review";
+// Legacy full-text snapshots from before the change log. Their names still count
+// for the due check; the first successful review deletes them.
 const SNAPSHOT_PREFIX = "snapshot-";
+const MARKER_PREFIX = "marker-";
+// The newest marker is the baseline; the second is a fallback if it cannot be read.
+const KEEP_MARKERS = 2;
+const NATIVE_COVERAGE = "The change log in each bank captures every writer (adapter, native OMP, external). Banks in changeLogMissing and banks listed under baseline have no change detection for this period.";
+
+export type BaselineReason = "log_missing" | "log_installed" | "log_reinstalled" | "sequence_reset" | "pruned_past_cursor" | "invalid_cursor";
 
 export interface ReviewOptions {
 	readonly context?: AdapterContext;
 	readonly now?: Date | (() => Date);
-	readonly writeSnapshot?: boolean;
-	/** Fixture-only seam for proving failed writes preserve the prior snapshot. */
-	readonly snapshotWriter?: (directory: string, completedAt: string, rows: readonly ReviewRow[], journalPath?: string) => string;
+	/** false reports without writing a marker, pruning the log, or retiring snapshots. */
+	readonly writeMarker?: boolean;
+	/** Fixture-only seam for proving a failed marker write keeps the prior marker and the log. */
+	readonly markerWriter?: (directory: string, completedAt: string, payload: ReviewMarker) => string;
 }
 
 export interface ReviewDueResult {
@@ -29,9 +39,16 @@ export interface ReviewDueResult {
 export interface ReviewResult {
 	readonly status: "ok" | "error";
 	readonly due: ReviewDueResult;
-	readonly snapshotPath?: string;
-	readonly previousSnapshotPath?: string;
+	readonly markerPath?: string;
+	readonly previousMarkerPath?: string;
 	readonly report: {
+		/** Banks whose changes this period could not be read from the log, and why. */
+		readonly baseline: readonly { bank: string; reason: BaselineReason }[];
+		readonly changeLogMissing: readonly string[];
+		/** Banks in the previous marker that no longer exist. */
+		readonly banksRemoved: readonly string[];
+		/** Banks whose log could not be pruned this time (retried next review). */
+		readonly pruneSkipped: readonly string[];
 		readonly banks: readonly string[];
 		readonly added: readonly ReviewRow[];
 		readonly changed: readonly ReviewChange[];
@@ -61,8 +78,11 @@ export interface ReviewRow {
 }
 
 export interface ReviewChange {
+	/** The tracked columns as they were at the previous review. */
 	readonly before: ReviewRow;
 	readonly after: ReviewRow;
+	/** Tracked columns that changed since the previous review. */
+	readonly columns: readonly string[];
 }
 
 export interface JournalGap {
@@ -70,10 +90,21 @@ export interface JournalGap {
 	readonly operationId: string;
 }
 
-interface Snapshot {
+export interface MarkerBank {
+	readonly installId: string | null;
+	readonly seq: number;
+}
+
+export interface ReviewMarker {
 	readonly completedAt: string;
-	readonly rows: readonly ReviewRow[];
-	readonly journalPath?: string;
+	readonly banks: Record<string, MarkerBank>;
+}
+
+interface LoadedMarker {
+	readonly path: string;
+	readonly completedAt: string;
+	/** A bank whose entry is malformed maps to undefined: known, but no usable cursor. */
+	readonly banks: Map<string, MarkerBank | undefined>;
 }
 
 function nowValue(value: ReviewOptions["now"]): Date {
@@ -107,10 +138,48 @@ function privateSnapshotFile(filePath: string): boolean {
 }
 
 function snapshotFiles(dir: string): string[] {
+	return prefixedFiles(dir, SNAPSHOT_PREFIX);
+}
+
+function markerFiles(dir: string): string[] {
+	return prefixedFiles(dir, MARKER_PREFIX);
+}
+
+function pruneOldest(files: readonly string[], keep: number): void {
+	for (const file of files.slice(0, Math.max(0, files.length - keep))) {
+		try { unlinkSync(file); } catch { /* A file another review already removed is fine. */ }
+	}
+}
+
+function validMarkerBank(value: unknown): MarkerBank | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const entry = value as Record<string, unknown>;
+	const installId = entry.installId;
+	if (installId !== null && typeof installId !== "string") return undefined;
+	if (typeof entry.seq !== "number" || !Number.isSafeInteger(entry.seq) || entry.seq < 0) return undefined;
+	return { installId, seq: entry.seq };
+}
+
+function loadMarker(dir: string): LoadedMarker | undefined {
+	const files = markerFiles(dir);
+	for (let index = files.length - 1; index >= 0; index -= 1) {
+		try {
+			const parsed = JSON.parse(readFileSync(files[index], "utf8")) as Record<string, unknown>;
+			const banks = parsed.banks;
+			if (typeof parsed.completedAt !== "string" || banks === null || typeof banks !== "object" || Array.isArray(banks)) continue;
+			const map = new Map<string, MarkerBank | undefined>();
+			for (const [bank, value] of Object.entries(banks as Record<string, unknown>)) map.set(bank, validMarkerBank(value));
+			return { path: files[index], completedAt: parsed.completedAt, banks: map };
+		} catch { /* Skip an unreadable marker and use an older one. */ }
+	}
+	return undefined;
+}
+
+function prefixedFiles(dir: string, prefix: string): string[] {
 	try {
 		if (existsSync(dir) && lstatSync(dir).isSymbolicLink()) return [];
 		return readdirSync(dir)
-			.filter(name => name.startsWith(SNAPSHOT_PREFIX) && name.endsWith(".json"))
+			.filter(name => name.startsWith(prefix) && name.endsWith(".json"))
 			.map(name => path.join(dir, name))
 			.filter(privateSnapshotFile)
 			.sort()
@@ -119,26 +188,11 @@ function snapshotFiles(dir: string): string[] {
 	}
 }
 
-function loadSnapshot(dir: string): { path?: string; snapshot?: Snapshot } {
-	const files = snapshotFiles(dir);
-	for (let index = files.length - 1; index >= 0; index -= 1) {
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(files[index], "utf8"));
-			if (parsed !== null && typeof parsed === "object" && typeof (parsed as Snapshot).completedAt === "string" && Array.isArray((parsed as Snapshot).rows)) {
-				return { path: files[index], snapshot: parsed as Snapshot };
-			}
-		} catch {
-			// Preserve malformed/old snapshots and continue to the last usable one.
-		}
-	}
-	return {};
-}
-
 function dueCheck(context: AdapterContext, dueDays: number, now: Date): ReviewDueResult {
 	const dir = snapshotDir(context);
 	let timestamp: number | undefined;
-	for (const file of snapshotFiles(dir)) {
-		const match = /^snapshot-(\d+)-[A-Za-z0-9]+\.json$/.exec(path.basename(file));
+	for (const file of [...snapshotFiles(dir), ...markerFiles(dir)]) {
+		const match = /^(?:snapshot|marker)-(\d+)-[A-Za-z0-9]+\.json$/.exec(path.basename(file));
 		if (!match) continue;
 		const value = Number(match[1]);
 		if (!Number.isFinite(value) || value > now.getTime() + 300_000) continue;
@@ -171,9 +225,8 @@ function parseMetadata(value: unknown): Record<string, unknown> {
 	} catch { return {}; }
 }
 
-function readRows(bank: string, dbPath: string, now: Date): ReviewRow[] {
-	const db = new Database(dbPath, { readonly: true });
-	try {
+function readRows(bank: string, db: Database, now: Date): ReviewRow[] {
+	{
 		const rows: ReviewRow[] = [];
 		for (const table of ["working_memory", "episodic_memory"] as const) {
 			const exists = db.query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { present?: number } | null;
@@ -198,8 +251,6 @@ function readRows(bank: string, dbPath: string, now: Date): ReviewRow[] {
 			}
 		}
 		return rows;
-	} finally {
-		db.close();
 	}
 }
 
@@ -256,13 +307,12 @@ function journalGaps(context: AdapterContext): { path?: string; gaps: JournalGap
 	return { path: journalPath, gaps, memoryKeys };
 }
 
-function writeSnapshot(dir: string, completedAt: string, rows: readonly ReviewRow[], journalPath?: string): string {
+function writePrivateJson(dir: string, prefix: string, completedAt: string, payload: unknown): string {
 	ensurePrivateDir(dir);
-	const name = `${SNAPSHOT_PREFIX}${Date.parse(completedAt)}-${Math.random().toString(36).slice(2)}.json`;
+	const name = `${prefix}${Date.parse(completedAt)}-${Math.random().toString(36).slice(2)}.json`;
 	const target = path.join(dir, name);
 	const temporary = `${target}.tmp-${process.pid}`;
-	const snapshot: Snapshot = { completedAt, rows, ...(journalPath ? { journalPath } : {}) };
-	writeFileSync(temporary, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
+	writeFileSync(temporary, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
 	chmodSync(temporary, 0o600);
 	const fileFd = openSync(temporary, "r");
 	try { fsyncSync(fileFd); } finally { closeSync(fileFd); }
@@ -271,7 +321,7 @@ function writeSnapshot(dir: string, completedAt: string, rows: readonly ReviewRo
 		chmodSync(target, 0o600);
 		const dirFd = openSync(dir, "r");
 		try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-	} catch { /* The rename already committed the private snapshot. */ }
+	} catch { /* The rename already committed the private file. */ }
 	return target;
 }
 
@@ -289,12 +339,16 @@ function dedupeBanks(context: AdapterContext): string[] {
 	return [...banks];
 }
 
+export function listBanks(context: AdapterContext): { bank: string; dbPath: string }[] {
+	return dedupeBanks(context).map(bank => ({ bank, dbPath: dbPathForBank(context, bank) })).filter(entry => existsSync(entry.dbPath));
+}
+
 function dbPathForBank(context: AdapterContext, bank: string): string {
 	return resolveBankDbPath({ dataDir: context.dataDir, baseBank: context.baseBank, baseDbPath: context.dbPath }, bank);
 }
 
 function emptyReport(banks: readonly string[], journalGapsValue: readonly JournalGap[] = []): ReviewResult["report"] {
-	return { banks, added: [], changed: [], missing: [], stale: [], duplicates: [], expired: [], superseded: [], unresolvedImports: [], unjournaledNativeOrExternal: [], journalGaps: journalGapsValue, nativeCoverage: "Adapter journal is not universal; native OMP and external writes appear as unjournaled snapshot changes." };
+	return { baseline: [], changeLogMissing: [], banksRemoved: [], pruneSkipped: [], banks, added: [], changed: [], missing: [], stale: [], duplicates: [], expired: [], superseded: [], unresolvedImports: [], unjournaledNativeOrExternal: [], journalGaps: journalGapsValue, nativeCoverage: NATIVE_COVERAGE };
 }
 
 export function reviewDue(cwd: string, dueDays = 7, options: ReviewOptions = {}): ReviewDueResult {
@@ -302,14 +356,108 @@ export function reviewDue(cwd: string, dueDays = 7, options: ReviewOptions = {})
 	return dueCheck(context, Math.max(1, dueDays), nowValue(options.now));
 }
 
+type Prior =
+	| { readonly kind: "first_review" }
+	| { readonly kind: "new_bank" }
+	| { readonly kind: "known"; readonly entry: MarkerBank | undefined };
+
+interface BankRead {
+	readonly bank: string;
+	readonly dbPath: string;
+	readonly present: boolean;
+	readonly installId: string | null;
+	readonly maxSeq: number;
+	readonly rows: ReviewRow[];
+	/** Every row is new to the review: the first review, or a bank absent from the last marker. */
+	readonly allAdded: boolean;
+	readonly baseline?: BaselineReason;
+	readonly entries?: readonly ChangeEntry[];
+}
+
+function baselineReason(present: boolean, state: { installId: string | null; maxSeq: number; prunedThrough: number }, entry: MarkerBank | undefined): BaselineReason | undefined {
+	if (!present) return "log_missing";
+	if (entry === undefined) return "invalid_cursor";
+	if (entry.installId === null) return "log_installed";
+	if (entry.installId !== state.installId) return "log_reinstalled";
+	if (state.maxSeq < entry.seq) return "sequence_reset";
+	if (state.prunedThrough > entry.seq) return "pruned_past_cursor";
+	return undefined;
+}
+
+function readBank(bank: string, dbPath: string, now: Date, prior: Prior): BankRead {
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		// One read transaction, so the log position and the rows describe the same moment.
+		db.exec("BEGIN");
+		const state = readLogState(db);
+		const rows = readRows(bank, db, now);
+		const base = { bank, dbPath, present: state.present, installId: state.present ? state.installId : null, maxSeq: state.present ? state.maxSeq : 0, rows };
+		if (prior.kind !== "known") return { ...base, allAdded: true };
+		const baseline = baselineReason(state.present, state, prior.entry);
+		if (baseline || !prior.entry) return { ...base, allAdded: false, baseline };
+		const entries = readChanges(db, prior.entry.seq).filter(entry => entry.seq <= state.maxSeq);
+		return { ...base, allAdded: false, entries };
+	} finally {
+		try { db.exec("COMMIT"); } catch { /* no open transaction */ }
+		db.close();
+	}
+}
+
+function rowBeforeChange(bank: string, entry: ChangeEntry): ReviewRow {
+	const row = { ...(entry.oldRow ?? {}), id: entry.memoryId };
+	const timestamp = typeof row.timestamp === "string" ? row.timestamp : null;
+	return { bank, table: entry.memoryTable, id: entry.memoryId, contentHash: rowHash(row), timestamp, row };
+}
+
+function changedColumns(entries: readonly ChangeEntry[], before: Record<string, unknown>, after: Record<string, unknown>): string[] {
+	const changed = new Set<string>();
+	for (const entry of entries) if (entry.op === "update") for (const column of entry.columns) changed.add(column);
+	if (entries.some(entry => entry.op === "delete")) {
+		// Deleted and recreated under the same id: compare what was there with what is there now.
+		for (const column of TRACKED_COLUMNS) {
+			if (!(column in before)) continue;
+			if (column === "content" && before.content === null) { changed.add(column); continue; } // transcript text is never logged
+			if ((before[column] ?? null) !== (after[column] ?? null)) changed.add(column);
+		}
+	}
+	return TRACKED_COLUMNS.filter(column => changed.has(column));
+}
+
+// The first log entry for a memory since the last review holds its state at that
+// review, so the net change is that entry against the current row.
+function bankDiff(read: BankRead, out: { added: ReviewRow[]; changed: ReviewChange[]; missing: ReviewRow[] }): void {
+	if (read.allAdded) { out.added.push(...read.rows); return; }
+	if (!read.entries) return;
+	const current = new Map(read.rows.map(row => [`${row.table}:${row.id}`, row]));
+	const groups = new Map<string, ChangeEntry[]>();
+	for (const entry of read.entries) {
+		const key = `${entry.memoryTable}:${entry.memoryId}`;
+		groups.set(key, [...(groups.get(key) ?? []), entry]);
+	}
+	for (const [key, entries] of groups) {
+		const now = current.get(key);
+		const first = entries[0];
+		if (first.op === "insert") { if (now) out.added.push(now); continue; }
+		const before = rowBeforeChange(read.bank, first);
+		if (!now) { out.missing.push(before); continue; }
+		const columns = changedColumns(entries, before.row, now.row);
+		if (columns.length > 0) out.changed.push({ before, after: now, columns });
+	}
+}
+
+function writeMarker(dir: string, completedAt: string, payload: ReviewMarker): string {
+	return writePrivateJson(dir, MARKER_PREFIX, completedAt, payload);
+}
+
 export function review(cwd: string, dueDays = 7, options: ReviewOptions = {}): ReviewResult {
 	const context = options.context ?? contextForCwd(path.resolve(cwd));
 	const now = nowValue(options.now);
 	const due = dueCheck(context, Math.max(1, dueDays), now);
 	const banks = dedupeBanks(context);
-	const previous = loadSnapshot(snapshotDir(context));
-	const current: ReviewRow[] = [];
+	const dir = snapshotDir(context);
+	const marker = loadMarker(dir);
 	try {
+		const reads: BankRead[] = [];
 		for (const bank of banks) {
 			const dbPath = dbPathForBank(context, bank);
 			if (!existsSync(dbPath)) {
@@ -317,43 +465,49 @@ export function review(cwd: string, dueDays = 7, options: ReviewOptions = {}): R
 				continue;
 			}
 			if (!statSync(dbPath).isFile()) throw new Error(`store_unavailable bank=${bank} dbPath=${dbPath} configFiles=${context.configFiles.join(",") || "(none)"}`);
-			current.push(...readRows(bank, dbPath, now));
+			const prior: Prior = !marker ? { kind: "first_review" } : marker.banks.has(bank) ? { kind: "known", entry: marker.banks.get(bank) } : { kind: "new_bank" };
+			reads.push(readBank(bank, dbPath, now, prior));
 		}
+		const current = reads.flatMap(read => read.rows);
+		const diff = { added: [] as ReviewRow[], changed: [] as ReviewChange[], missing: [] as ReviewRow[] };
+		for (const read of reads) bankDiff(read, diff);
+		const reviewed = new Set(reads.map(read => read.bank));
 		const journal = journalGaps(context);
-		const oldByKey = new Map((previous.snapshot?.rows ?? []).map(row => [`${row.bank}:${row.table}:${row.id}`, row]));
-		const currentByKey = new Map(current.map(row => [`${row.bank}:${row.table}:${row.id}`, row]));
-		const added: ReviewRow[] = [];
-		const changed: ReviewChange[] = [];
-		for (const [key, row] of currentByKey) {
-			const before = oldByKey.get(key);
-			if (!before) added.push(row);
-			else if (before.contentHash !== row.contentHash) changed.push({ before, after: row });
-		}
-		const missing: ReviewRow[] = [];
-		for (const [key, row] of oldByKey) if (!currentByKey.has(key)) missing.push(row);
 		const byHash = new Map<string, ReviewRow[]>();
 		for (const row of current) byHash.set(row.contentHash, [...(byHash.get(row.contentHash) ?? []), row]);
 		const duplicates = [...byHash.values()].filter(group => group.length > 1).flat();
+		const pruneSkipped: string[] = [];
 		const report = {
+			baseline: reads.flatMap(read => (read.baseline ? [{ bank: read.bank, reason: read.baseline }] : [])),
+			changeLogMissing: reads.filter(read => !read.present).map(read => read.bank),
+			banksRemoved: marker ? [...marker.banks.keys()].filter(bank => !reviewed.has(bank)).sort() : [],
+			pruneSkipped,
 			banks,
-			added,
-			changed,
-			missing,
+			added: diff.added,
+			changed: diff.changed,
+			missing: diff.missing,
 			stale: current.filter(row => row.flags?.includes("stale")),
 			duplicates,
 			expired: current.filter(row => row.flags?.includes("expired")),
 			superseded: current.filter(row => row.flags?.includes("superseded")),
 			unresolvedImports: current.filter(row => row.flags?.includes("unresolved_import")),
-			unjournaledNativeOrExternal: added.filter(row => !journal.memoryKeys.has(coverageKey(row.bank, row.table, row.id))).map(row => ({ ...row, coverage: "unjournaled_native_or_external" as const })),
+			unjournaledNativeOrExternal: diff.added.filter(row => !journal.memoryKeys.has(coverageKey(row.bank, row.table, row.id))).map(row => ({ ...row, coverage: "unjournaled_native_or_external" as const })),
 			journalGaps: journal.gaps,
-			nativeCoverage: "Adapter journal is not universal; native OMP and external writes appear as unjournaled snapshot changes.",
+			nativeCoverage: NATIVE_COVERAGE,
 		};
-		const shouldWrite = options.writeSnapshot !== false;
-		const snapshotPath = shouldWrite
-			? (options.snapshotWriter ?? writeSnapshot)(snapshotDir(context), now.toISOString(), current, journal.path)
-			: undefined;
-		return { status: "ok", due, snapshotPath, previousSnapshotPath: previous.path, report };
+		if (options.writeMarker === false) return { status: "ok", due, previousMarkerPath: marker?.path, report };
+		const completedAt = now.toISOString();
+		const payload: ReviewMarker = { completedAt, banks: Object.fromEntries(reads.map(read => [read.bank, { installId: read.installId, seq: read.maxSeq }])) };
+		// The marker is the commit point: only after it is durable is the log pruned
+		// through the positions it records, and the legacy snapshots retired.
+		const markerPath = (options.markerWriter ?? writeMarker)(dir, completedAt, payload);
+		pruneOldest(snapshotFiles(dir), 0);
+		pruneOldest(markerFiles(dir), KEEP_MARKERS);
+		for (const read of reads) {
+			if (read.present && pruneChanges(read.dbPath, read.maxSeq).status !== "pruned") pruneSkipped.push(read.bank);
+		}
+		return { status: "ok", due, markerPath, previousMarkerPath: marker?.path, report };
 	} catch (error) {
-		return { status: "error", due, previousSnapshotPath: previous.path, report: emptyReport(banks), error: String(error) };
+		return { status: "error", due, previousMarkerPath: marker?.path, report: emptyReport(banks), error: String(error) };
 	}
 }

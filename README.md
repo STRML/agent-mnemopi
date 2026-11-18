@@ -43,10 +43,10 @@ adapter/dist/shared-memory.js review --cwd /absolute/project --due-days 7
 content is marked as untrusted data and is never a host instruction. Startup
 reports missing or unreadable stores instead of silently opening a replacement
 database. It bounds injected context and reports omitted or stale notes. A due
-review runs automatically at startup on its weekly schedule by default. It is
-read-only, does not prune or repair memories, and publishes a private full-text
-snapshot only after successful completion; the explicit `review` command is also
-available. Startup reads each row's decision columns, decides admission in JS by parsing
+review runs automatically at startup on its weekly schedule by default. It
+reads changes from a change log the adapter installs in each bank, never prunes
+or repairs memories, and records a small private marker after successful
+completion; the explicit `review` command is also available. Startup reads each row's decision columns, decides admission in JS by parsing
 metadata with JSON.parse, and then reads content only for admitted rows. It
 keeps a one-year timestamp window for project-scoped rows, keeps durable global
 preferences, corrections, and identities regardless of age (excluding only

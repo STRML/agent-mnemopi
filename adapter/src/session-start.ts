@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { changeLogPresent } from "./changelog";
+import { failureCovers, readInstallFailure } from "./changelog-install";
 import { contextForCwd, type AdapterContext } from "./context";
 import { resolveBankDbPath } from "./reliability/bank-path";
 import { selectInjectableRecall as policySelectInjectableRecall, type RecallCandidate } from "./reliability/policy";
@@ -75,6 +77,8 @@ export interface SessionStartOptions {
 	/** Calling harness (`--host`). Rows whose metadata names a different harness are not admitted. */
 	readonly harness?: string;
 	readonly launchReviewSweep?: (cwd: string) => Promise<{ started: boolean; error?: string }>;
+	/** Starts a detached `changelog-install` when a recall bank has no change log yet. */
+	readonly launchChangeLogInstall?: (cwd: string) => Promise<{ started: boolean; error?: string }>;
 }
 
 export interface SessionStartOutput {
@@ -605,6 +609,36 @@ async function launchSweep(context: AdapterContext, now: Date, launcher: NonNull
 	return `${note}; sweep could not start`;
 }
 
+function changeLogMissing(dbPath: string): boolean {
+	if (!existsSync(dbPath)) return false;
+	let db: Database | undefined;
+	try {
+		db = new Database(dbPath, { readonly: true });
+		return !changeLogPresent(db);
+	} catch {
+		// An unreadable bank is not known to have the log; the install reports why.
+		return true;
+	} finally {
+		db?.close();
+	}
+}
+
+async function scheduleChangeLogInstall(context: AdapterContext, banks: readonly string[], now: Date, options: SessionStartOptions): Promise<string | undefined> {
+	if (!options.launchChangeLogInstall) return undefined;
+	const missing = banks.filter(bank => changeLogMissing(dbPathForBank(context, bank)));
+	if (missing.length === 0) return undefined;
+	// Back off only for banks a recent install already failed on; a new bank still gets its log.
+	const failure = readInstallFailure(context);
+	if (missing.every(bank => failureCovers(failure, bank, now))) return undefined;
+	let launch: { started: boolean; error?: string };
+	try {
+		launch = await options.launchChangeLogInstall(context.cwd);
+	} catch (error) {
+		launch = { started: false, error: String(error) };
+	}
+	return launch.started ? undefined : `CHANGE LOG: install launch failed (${(launch.error ?? "unknown launch error").slice(0, 120)})`;
+}
+
 function contextOrThrow(cwd: string, options: SessionStartOptions): AdapterContext {
 	return options.context ?? contextForCwd(path.resolve(cwd));
 }
@@ -659,6 +693,8 @@ export async function sessionStart(cwd: string, options: SessionStartOptions = {
 	const decisionBudget = requested - STARTUP_LIMIT >= decisionCost ? decisionCost : 0;
 	const effectiveMax = Math.min(requested, STARTUP_LIMIT + decisionBudget);
 	const reviewNote = await scheduleReview(context, now, options, errors);
+	const changeLogNote = await scheduleChangeLogInstall(context, banks, now, options);
+	if (changeLogNote) notes.push(changeLogNote);
 	const systemMessage = errors.length > 0
 		? `Mnemopi SessionStart warning: ${errors.join("; ")}. Memory recall did not silently succeed.`
 		: undefined;
