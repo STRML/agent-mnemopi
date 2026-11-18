@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
+import { CHANGE_LOG_TABLE, changeLogPresent, installChangeLog, uninstallChangeLog } from "../src/changelog";
+import { readInstallFailure, recordInstallOutcome } from "../src/changelog-install";
 import { review, reviewDue } from "../src/review";
 import { runLockedReview, type LockedReviewResult } from "../src/review-sweep";
 import { sessionStart, startupDbPath } from "../src/session-start";
@@ -67,6 +69,10 @@ function reviewDirOf(fx: Fixture): string {
 
 function snapshotNames(fx: Fixture): string[] {
 	try { return readdirSync(reviewDirOf(fx)).filter(name => name.startsWith("snapshot-") && name.endsWith(".json")).sort(); } catch { return []; }
+}
+
+function markerNames(fx: Fixture): string[] {
+	try { return readdirSync(reviewDirOf(fx)).filter(name => name.startsWith("marker-") && name.endsWith(".json")).sort(); } catch { return []; }
 }
 
 function leftovers(fx: Fixture): string[] {
@@ -171,7 +177,7 @@ describe("SessionStart bounded metadata recall", () => {
 			expect(output.hookSpecificOutput.additionalContext).not.toContain("not valid at startup time");
 			// Without a launcher the hook only reports the schedule; it never reviews inline.
 			expect(output.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (no successful snapshot");
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 		} finally { close(fx); }
 	});
 
@@ -515,7 +521,7 @@ describe("SessionStart bounded metadata recall", () => {
 		} finally { close(fx); }
 	});
 
-	it("backs off repeated failed review sweeps without creating a successful snapshot", async () => {
+	it("backs off repeated failed review sweeps without creating a successful marker", async () => {
 		const fx = fixture();
 		try {
 			const now = new Date("2026-09-10T00:00:00.000Z");
@@ -523,20 +529,20 @@ describe("SessionStart bounded metadata recall", () => {
 			// failure is in the snapshot write, so the startup read itself stays healthy.
 			const launches: LockedReviewResult[] = [];
 			const launchReviewSweep = async () => {
-				launches.push(runLockedReview(fx.context, { mode: "sweep", now, waitMs: 0, snapshotWriter: () => { throw new Error("simulated snapshot write failure"); } }));
+				launches.push(runLockedReview(fx.context, { mode: "sweep", now, waitMs: 0, markerWriter: () => { throw new Error("simulated marker write failure"); } }));
 				return { started: true as const };
 			};
 			const first = await sessionStart(fx.root, { context: fx.context, now, launchReviewSweep });
 			expect(first.hookSpecificOutput.additionalContext).toContain("sweep started in background");
 			expect(launches.map(result => result.status)).toEqual(["error"]);
 			const reviewDir = path.join(fx.context.dataDir, ".adapter-review");
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 
 			const second = await sessionStart(fx.root, { context: fx.context, now, launchReviewSweep });
 			expect(second.hookSpecificOutput.additionalContext).toContain("REVIEW STATUS: due (retry deferred");
-			expect(second.hookSpecificOutput.additionalContext).toContain("last_error=Error: simulated snapshot write failure");
+			expect(second.hookSpecificOutput.additionalContext).toContain("last_error=Error: simulated marker write failure");
 			expect(launches.length).toBe(1);
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 			const failure = JSON.parse(readFileSync(path.join(reviewDir, "review-failure.json"), "utf8")) as { attempts: number; retryAt: string };
 			expect(failure.attempts).toBe(1);
 			expect(Date.parse(failure.retryAt)).toBeGreaterThan(now.getTime());
@@ -799,9 +805,10 @@ describe("SessionStart memory index", () => {
 });
 
 describe("non-destructive review snapshots", () => {
-	it("reports additions, changes, missing rows, and preserves full private snapshots", () => {
+	it("reports additions, changes, missing rows, and writes a private marker", () => {
 		const fx = fixture();
 		try {
+			installChangeLog(fx.context.dbPath);
 			add(fx, "one", "before", { kind: "preference" }, "2026-09-01T00:00:00.000Z");
 			const first = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-01T00:00:00.000Z") });
 			expect(first.status).toBe("ok");
@@ -814,10 +821,11 @@ describe("non-destructive review snapshots", () => {
 			fx.db.run("DELETE FROM working_memory WHERE id = ?", ["one"]);
 			const third = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-03T00:00:00.000Z") });
 			expect(third.report.missing.map(row => row.id)).toContain("one");
-			const snapshotPath = third.snapshotPath as string;
-			expect(statSync(path.dirname(snapshotPath)).mode & 0o777).toBe(0o700);
-			expect(statSync(snapshotPath).mode & 0o777).toBe(0o600);
-			expect(JSON.parse(readFileSync(snapshotPath, "utf8")).rows[0].row.content).toBe("added");
+			expect(third.report.missing.find(row => row.id === "one")?.row.content).toBe("after");
+			const markerPath = third.markerPath as string;
+			expect(statSync(path.dirname(markerPath)).mode & 0o777).toBe(0o700);
+			expect(statSync(markerPath).mode & 0o777).toBe(0o600);
+			expect(JSON.parse(readFileSync(markerPath, "utf8")).banks.default.seq).toBeGreaterThan(0);
 		} finally { close(fx); }
 	});
 
@@ -851,20 +859,23 @@ describe("non-destructive review snapshots", () => {
 		} finally { close(fx); }
 	});
 
-	it("keeps the previous successful snapshot when a later snapshot write fails", () => {
+	it("keeps the previous marker and the log when a later marker write fails", () => {
 		const fx = fixture();
 		try {
+			installChangeLog(fx.context.dbPath);
 			add(fx, "one", "stable", { kind: "preference" }, "2026-09-10T00:00:00.000Z");
 			const first = review(fx.root, 7, { context: fx.context, now: new Date("2026-09-10T00:00:00.000Z") });
-			const previousPath = first.snapshotPath as string;
+			const previousPath = first.markerPath as string;
+			add(fx, "two", "later", { kind: "preference" }, "2026-09-11T00:00:00.000Z");
+			const before = (fx.db.query(`SELECT COUNT(*) AS n FROM ${CHANGE_LOG_TABLE}`).get() as { n: number }).n;
 			const failed = review(fx.root, 7, {
 				context: fx.context,
 				now: new Date("2026-09-11T00:00:00.000Z"),
-				snapshotWriter: () => { throw new Error("simulated snapshot write failure"); },
+				markerWriter: () => { throw new Error("simulated marker write failure"); },
 			});
 			expect(failed.status).toBe("error");
-			expect(failed.previousSnapshotPath).toBe(previousPath);
 			expect(existsSync(previousPath)).toBe(true);
+			expect((fx.db.query(`SELECT COUNT(*) AS n FROM ${CHANGE_LOG_TABLE}`).get() as { n: number }).n).toBe(before);
 		} finally { close(fx); }
 	});
 
@@ -936,7 +947,7 @@ describe("non-destructive review snapshots", () => {
 		} finally { close(fx); }
 	});
 
-	it("never writes a snapshot when the database is malformed", () => {
+	it("never writes a marker when the database is malformed", () => {
 		const fx = fixture();
 		try {
 			fx.db.exec("DROP TABLE episodic_memory");
@@ -1310,7 +1321,7 @@ describe("SessionStart review scheduling", () => {
 			const output = await sessionStart(fx.root, { context: fx.context, now: SWEEP_NOW, launchReviewSweep: launcher.launch });
 			expect(launcher.calls).toEqual([fx.context.cwd]);
 			expect(output.hookSpecificOutput.additionalContext).toContain("sweep started in background");
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 			expect(output.systemMessage).toBeUndefined();
 		} finally { close(fx); }
 	});
@@ -1392,14 +1403,14 @@ describe("SessionStart review scheduling", () => {
 });
 
 describe("locked review sweep", () => {
-	it("publishes a snapshot, clears a stale failure record, and frees the lock", () => {
+	it("publishes a marker, clears a stale failure record, and frees the lock", () => {
 		const fx = fixture();
 		try {
 			add(fx, "one", "stable", { kind: "preference" }, "2026-09-09T00:00:00.000Z");
 			plantFailure(fx, { attempts: 2, failedAt: "2026-09-09T20:00:00.000Z", retryAt: "2026-09-09T21:00:00.000Z", error: "old failure" });
 			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
 			expect(result.status).toBe("ok");
-			expect(snapshotNames(fx).length).toBe(1);
+			expect(markerNames(fx).length).toBe(1);
 			expect(leftovers(fx)).toEqual([]);
 			expect(readFailure(fx)).toBeUndefined();
 			expect(lockIsFree(fx)).toBe(true);
@@ -1412,7 +1423,7 @@ describe("locked review sweep", () => {
 		try {
 			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
 			expect(result.status).toBe("busy");
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 			expect(readFailure(fx)).toBeUndefined();
 		} finally { releaseLock(lock); close(fx); }
 	});
@@ -1424,7 +1435,7 @@ describe("locked review sweep", () => {
 			const second = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
 			expect(second.status).toBe("skipped");
 			expect(second.reason).toBe("not_due");
-			expect(snapshotNames(fx).length).toBe(1);
+			expect(markerNames(fx).length).toBe(1);
 		} finally { close(fx); }
 	});
 
@@ -1435,7 +1446,7 @@ describe("locked review sweep", () => {
 			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
 			expect(result.status).toBe("skipped");
 			expect(result.reason).toBe("deferred");
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 		} finally { close(fx); }
 	});
 
@@ -1449,22 +1460,22 @@ describe("locked review sweep", () => {
 			const failure = readFailure(fx);
 			expect(failure?.attempts).toBe(1);
 			expect(Date.parse(failure?.retryAt ?? "")).toBeGreaterThan(SWEEP_NOW.getTime());
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 			expect(leftovers(fx)).toEqual([]);
 			expect(lockIsFree(fx)).toBe(true);
 		} finally { close(fx); }
 	});
 
-	it("removes stage and temp files a dead run left behind, and keeps real snapshots", () => {
+	it("removes stage and temp files a dead run left behind, and retires legacy snapshots", () => {
 		const fx = fixture();
 		try {
-			const old = plantSnapshot(fx, new Date("2026-08-01T00:00:00.000Z"), validSnapshotBody("2026-08-01T00:00:00.000Z"));
-			for (const name of [".stage-1-a.json", ".stage-2-b.json.tmp-123", "snapshot-3-c.json.tmp-9"]) writeFileSync(path.join(reviewDirOf(fx), name), "orphan", { mode: 0o600 });
+			plantSnapshot(fx, new Date("2026-08-01T00:00:00.000Z"), validSnapshotBody("2026-08-01T00:00:00.000Z"));
+			for (const name of [".stage-1-a.json", ".stage-2-b.json.tmp-123", "snapshot-3-c.json.tmp-9", "marker-4-d.json.tmp-7"]) writeFileSync(path.join(reviewDirOf(fx), name), "orphan", { mode: 0o600 });
 			const result = runLockedReview(fx.context, { mode: "sweep", now: SWEEP_NOW, waitMs: 0 });
 			expect(result.status).toBe("ok");
 			expect(leftovers(fx)).toEqual([]);
-			expect(snapshotNames(fx)).toContain(old);
-			expect(snapshotNames(fx).length).toBe(2);
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx).length).toBe(1);
 		} finally { close(fx); }
 	});
 
@@ -1487,10 +1498,10 @@ describe("locked review sweep", () => {
 				mode: "sweep",
 				now: SWEEP_NOW,
 				waitMs: 0,
-				snapshotWriter: (directory: string) => {
+				markerWriter: (directory: string) => {
 					duringRun = readFailure(fx);
-					const target = path.join(directory, `snapshot-${SWEEP_NOW.getTime()}-w9.json`);
-					writeFileSync(target, validSnapshotBody(SWEEP_NOW.toISOString()), { mode: 0o600 });
+					const target = path.join(directory, `marker-${SWEEP_NOW.getTime()}-w9.json`);
+					writeFileSync(target, JSON.stringify({ completedAt: SWEEP_NOW.toISOString(), banks: {} }), { mode: 0o600 });
 					return target;
 				},
 			});
@@ -1502,22 +1513,22 @@ describe("locked review sweep", () => {
 		} finally { close(fx); }
 	});
 
-	it("removes the temp file of a snapshot write that failed partway", () => {
+	it("removes the temp file of a marker write that failed partway", () => {
 		const fx = fixture();
 		try {
 			const result = runLockedReview(fx.context, {
 				mode: "sweep",
 				now: SWEEP_NOW,
 				waitMs: 0,
-				snapshotWriter: (directory: string) => {
-					writeFileSync(path.join(directory, `snapshot-${SWEEP_NOW.getTime()}-partial.json.tmp-1`), "partial", { mode: 0o600 });
+				markerWriter: (directory: string) => {
+					writeFileSync(path.join(directory, `marker-${SWEEP_NOW.getTime()}-partial.json.tmp-1`), "partial", { mode: 0o600 });
 					throw new Error("simulated disk full");
 				},
 			});
 			expect(result.status).toBe("error");
 			expect(result.error).toContain("simulated disk full");
 			expect(leftovers(fx)).toEqual([]);
-			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx)).toEqual([]);
 			expect(readFailure(fx)?.attempts).toBe(1);
 		} finally { close(fx); }
 	});
@@ -1543,7 +1554,317 @@ describe("locked review sweep", () => {
 			expect(performance.now() - started).toBeGreaterThan(300);
 			expect(result.status).toBe("ok");
 			expect(result.review?.report).toBeDefined();
-			expect(snapshotNames(fx).length).toBe(2);
+			expect(snapshotNames(fx)).toEqual([]);
+			expect(markerNames(fx).length).toBe(1);
+		} finally { close(fx); }
+	});
+
+	it("installs the change log inside the locked review, for explicit reviews too", () => {
+		const fx = fixture();
+		try {
+			const result = runLockedReview(fx.context, { mode: "explicit", now: SWEEP_NOW, waitMs: 0 });
+			expect(result.status).toBe("ok");
+			expect(result.install?.installed).toEqual(["default"]);
+			expect(changeLogPresent(fx.db)).toBe(true);
+		} finally { close(fx); }
+	});
+});
+
+describe("SessionStart change-log install", () => {
+	const START_NOW = new Date("2026-11-18T12:00:00Z");
+
+	function recordingLauncher(result: { started: boolean; error?: string } = { started: true }) {
+		const calls: string[] = [];
+		return { calls, launch: async (cwd: string) => { calls.push(cwd); return result; } };
+	}
+
+	it("launches changelog-install when a recall bank lacks the log", async () => {
+		const fx = fixture();
+		try {
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([fx.root]);
+		} finally { close(fx); }
+	});
+
+	it("does not launch when every recall bank has the log", async () => {
+		const fx = fixture();
+		try {
+			expect(installChangeLog(fx.context.dbPath).status).toBe("installed");
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("launches the install when a recall bank cannot be opened", async () => {
+		const fx = fixture(false);
+		try {
+			writeFileSync(fx.context.dbPath, "not a database");
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([fx.root]);
+		} finally { close(fx); }
+	});
+
+	it("skips the launch while a failed install is backing off", async () => {
+		const fx = fixture();
+		try {
+			mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+			writeFileSync(path.join(reviewDirOf(fx), "changelog-install-failure.json"), JSON.stringify({ failedAt: "2026-11-18T11:00:00Z", error: "x", banks: { default: "2026-11-18T13:00:00Z" } }), { mode: 0o600 });
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+			const later = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: new Date("2026-11-18T14:00:00Z"), launchChangeLogInstall: later.launch });
+			expect(later.calls).toEqual([fx.root]);
+		} finally { close(fx); }
+	});
+
+	it("treats a failure record without a bank list as covering every bank", async () => {
+		const fx = fixture();
+		try {
+			mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+			writeFileSync(path.join(reviewDirOf(fx), "changelog-install-failure.json"), JSON.stringify({ failedAt: "2026-11-18T11:00:00Z", retryAt: "2026-11-18T13:00:00Z", error: "x" }), { mode: 0o600 });
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("still launches for a bank the recorded install failure does not cover", async () => {
+		const fx = fixture();
+		try {
+			mkdirSync(reviewDirOf(fx), { recursive: true, mode: 0o700 });
+			writeFileSync(path.join(reviewDirOf(fx), "changelog-install-failure.json"), JSON.stringify({ failedAt: "2026-11-18T11:00:00Z", error: "x", banks: { other: "2026-11-18T13:00:00Z" } }), { mode: 0o600 });
+			const launcher = recordingLauncher();
+			await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: launcher.launch });
+			expect(launcher.calls).toEqual([fx.root]);
+		} finally { close(fx); }
+	});
+
+	it("keeps each bank's own retry deadline when another bank fails", () => {
+		const fx = fixture();
+		try {
+			const at = new Date("2026-11-18T12:59:00Z");
+			recordInstallOutcome(fx.context, { installed: [], present: [], busy: [], failed: [{ bank: "a", error: "x" }], skipped: [] }, new Date("2026-11-18T12:00:00Z"));
+			recordInstallOutcome(fx.context, { installed: [], present: [], busy: [], failed: [{ bank: "b", error: "y" }], skipped: ["a"] }, at);
+			const failure = readInstallFailure(fx.context);
+			expect(failure?.banks).toEqual({ a: "2026-11-18T13:00:00.000Z", b: "2026-11-18T13:59:00.000Z" });
+		} finally { close(fx); }
+	});
+
+	it("records a failed install for a bank named __proto__", () => {
+		const fx = fixture();
+		try {
+			recordInstallOutcome(fx.context, { installed: [], present: [], busy: [], failed: [{ bank: "__proto__", error: "x" }], skipped: [] }, new Date("2026-11-18T12:00:00Z"));
+			const banks = readInstallFailure(fx.context)?.banks ?? {};
+			expect(Object.keys(banks)).toEqual(["__proto__"]);
+		} finally { close(fx); }
+	});
+
+	it("adds a note only when the install launch fails", async () => {
+		const fx = fixture();
+		try {
+			const ok = await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: recordingLauncher().launch });
+			expect(ok.hookSpecificOutput.additionalContext).not.toContain("CHANGE LOG");
+			const failed = await sessionStart(fx.root, { context: fx.context, now: START_NOW, launchChangeLogInstall: recordingLauncher({ started: false, error: "boom" }).launch });
+			expect(failed.hookSpecificOutput.additionalContext).toContain("CHANGE LOG: install launch failed");
+		} finally { close(fx); }
+	});
+});
+
+describe("review from the change log, per bank", () => {
+	const DAY = 86_400_000;
+	const T0 = new Date("2026-11-18T12:00:00Z");
+	const at = (days: number) => new Date(T0.getTime() + days * DAY);
+	const otherPath = (fx: Fixture) => path.join(fx.context.dataDir, "banks", "other", "mnemopi.db");
+
+	function makeOther(fx: Fixture, withLog: boolean): Database {
+		mkdirSync(path.dirname(otherPath(fx)), { recursive: true });
+		const db = new Database(otherPath(fx));
+		db.exec("CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT, metadata_json TEXT, memory_type TEXT, valid_until TEXT, superseded_by TEXT, trust_tier TEXT); CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, timestamp TEXT, metadata_json TEXT);");
+		if (withLog) installChangeLog(otherPath(fx));
+		return db;
+	}
+
+	function logCount(db: Database): number {
+		return (db.query(`SELECT COUNT(*) AS n FROM ${CHANGE_LOG_TABLE}`).get() as { n: number }).n;
+	}
+
+	it("first review reports every row as added, lists every bank in the marker, and retires legacy snapshots", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			add(fx, "a", "text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			const other = makeOther(fx, false);
+			other.close();
+			plantSnapshot(fx, new Date("2026-11-10T00:00:00Z"), validSnapshotBody("2026-11-10T00:00:00Z"));
+			const result = review(fx.root, 7, { context: fx.context, now: T0 });
+			expect(result.status).toBe("ok");
+			expect(result.report.added.map(row => row.id)).toEqual(["a"]);
+			expect(result.report.changeLogMissing).toEqual(["other"]);
+			const marker = JSON.parse(readFileSync(result.markerPath as string, "utf8")) as { banks: Record<string, { installId: string | null; seq: number }> };
+			expect(Object.keys(marker.banks).sort()).toEqual(["default", "other"]);
+			expect(marker.banks.other.installId).toBeNull();
+			expect(typeof marker.banks.default.installId).toBe("string");
+			expect(snapshotNames(fx)).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("reports added, changed with columns, and missing from the log, then prunes the log", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			add(fx, "edit", "before text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			add(fx, "gone", "deleted text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			add(fx, "expire", "kept text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			expect(logCount(fx.db)).toBe(0);
+			add(fx, "new", "new text", { kind: "project_note" }, "2026-11-19T00:00:00Z");
+			fx.db.run("UPDATE working_memory SET content = 'after text' WHERE id = 'edit'");
+			fx.db.run("UPDATE working_memory SET valid_until = '2026-11-20T00:00:00Z' WHERE id = 'expire'");
+			fx.db.run("DELETE FROM working_memory WHERE id = 'gone'");
+			fx.db.run("UPDATE working_memory SET trust_tier = 'native' WHERE id = 'edit'");
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.status).toBe("ok");
+			expect(result.report.added.map(row => row.id)).toEqual(["new"]);
+			const changed = Object.fromEntries(result.report.changed.map(change => [change.after.id, change]));
+			expect(Object.keys(changed).sort()).toEqual(["edit", "expire"]);
+			expect(changed.edit.columns).toEqual(["content"]);
+			expect(changed.edit.before.row.content).toBe("before text");
+			expect(changed.edit.after.row.content).toBe("after text");
+			expect(changed.expire.columns).toEqual(["valid_until"]);
+			expect(result.report.missing.map(row => row.id)).toEqual(["gone"]);
+			expect(result.report.missing[0].row.content).toBe("deleted text");
+			expect(result.report.baseline).toEqual([]);
+			expect(logCount(fx.db)).toBe(0);
+		} finally { close(fx); }
+	});
+
+	it("reports a transcript metadata update as a metadata change, not a content change", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			fx.db.run("INSERT INTO working_memory (id, content, source, timestamp, metadata_json) VALUES ('t1', 'session text', 'coding-agent-transcript', '2026-11-01T00:00:00Z', '{}')");
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			fx.db.run("UPDATE working_memory SET metadata_json = '{\"x\":1}' WHERE id = 't1'");
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.changed.map(change => [change.after.id, change.columns])).toEqual([["t1", ["metadata_json"]]]);
+		} finally { close(fx); }
+	});
+
+	it("reports a delete followed by a reinsert of the same id as changed", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			add(fx, "r", "first", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			fx.db.run("DELETE FROM working_memory WHERE id = 'r'");
+			add(fx, "r", "second", { kind: "project_note" }, "2026-11-02T00:00:00Z");
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.added).toEqual([]);
+			expect(result.report.missing).toEqual([]);
+			expect(result.report.changed.map(change => change.after.id)).toEqual(["r"]);
+			expect(result.report.changed[0].columns).toContain("content");
+		} finally { close(fx); }
+	});
+
+	it("reports every row of a bank that was not in the previous marker as added", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			const other = makeOther(fx, false);
+			other.run("INSERT INTO working_memory (id, content) VALUES ('o1', 'before log')");
+			other.close();
+			installChangeLog(otherPath(fx));
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.added.filter(row => row.bank === "other").map(row => row.id)).toEqual(["o1"]);
+		} finally { close(fx); }
+	});
+
+	it("rebaselines a known bank that gains a log, and says so", () => {
+		const fx = fixture();
+		try {
+			add(fx, "a", "text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			installChangeLog(fx.context.dbPath);
+			fx.db.run("UPDATE working_memory SET content = 'changed' WHERE id = 'a'");
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.baseline).toEqual([{ bank: "default", reason: "log_installed" }]);
+			expect(result.report.changed).toEqual([]);
+		} finally { close(fx); }
+	});
+
+	it("rebaselines a bank whose log was reinstalled", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			expect(uninstallChangeLog(fx.context.dbPath).status).toBe("uninstalled");
+			installChangeLog(fx.context.dbPath);
+			add(fx, "a", "text", { kind: "project_note" }, "2026-11-01T00:00:00Z");
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.baseline).toEqual([{ bank: "default", reason: "log_reinstalled" }]);
+		} finally { close(fx); }
+	});
+
+	it("lists a bank that disappeared since the previous marker", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			makeOther(fx, true).close();
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			rmSync(path.dirname(otherPath(fx)), { recursive: true, force: true });
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.banksRemoved).toEqual(["other"]);
+		} finally { close(fx); }
+	});
+
+	it("rebaselines when the marker cursor is not a valid sequence", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			const first = review(fx.root, 7, { context: fx.context, now: T0 });
+			const marker = JSON.parse(readFileSync(first.markerPath as string, "utf8"));
+			marker.banks.default.seq = "500";
+			writeFileSync(first.markerPath as string, JSON.stringify(marker), { mode: 0o600 });
+			const result = review(fx.root, 7, { context: fx.context, now: at(7) });
+			expect(result.report.baseline).toEqual([{ bank: "default", reason: "invalid_cursor" }]);
+		} finally { close(fx); }
+	});
+
+	it("rebaselines when it falls back to a marker older than the pruned log", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			add(fx, "a", "text", { kind: "project_note" }, "2026-11-19T00:00:00Z");
+			const second = review(fx.root, 7, { context: fx.context, now: at(7) });
+			writeFileSync(second.markerPath as string, "{not json", { mode: 0o600 });
+			const result = review(fx.root, 7, { context: fx.context, now: at(14) });
+			expect(result.report.baseline).toEqual([{ bank: "default", reason: "pruned_past_cursor" }]);
+		} finally { close(fx); }
+	});
+
+	it("keeps two markers and never counts the failure record as one", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			plantFailure(fx, { attempts: 1, failedAt: "2026-11-01T00:00:00Z", retryAt: "2026-11-01T01:00:00Z", error: "x" });
+			for (let week = 0; week < 4; week += 1) review(fx.root, 7, { context: fx.context, now: at(week * 7) });
+			expect(markerNames(fx)).toHaveLength(2);
+		} finally { close(fx); }
+	});
+
+	it("reads due status from marker names", () => {
+		const fx = fixture();
+		try {
+			installChangeLog(fx.context.dbPath);
+			review(fx.root, 7, { context: fx.context, now: T0 });
+			expect(reviewDue(fx.root, 7, { context: fx.context, now: at(2) }).status).toBe("not_due");
+			expect(reviewDue(fx.root, 7, { context: fx.context, now: at(8) }).status).toBe("due");
 		} finally { close(fx); }
 	});
 });

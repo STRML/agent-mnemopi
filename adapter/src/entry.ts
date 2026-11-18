@@ -1,12 +1,15 @@
 import * as path from "node:path";
 import { contextForCwd, type AdapterContext } from "./context";
-import { launchReviewSweep, recordReviewFailure, runLockedReview, type LockedReviewResult } from "./review-sweep";
+import { installChangeLogAll, readInstallFailure, recordInstallOutcome } from "./changelog-install";
+import { uninstallChangeLog } from "./changelog";
+import { listBanks } from "./review";
+import { launchChangeLogInstall, launchReviewSweep, recordReviewFailure, runLockedReview, type LockedReviewResult } from "./review-sweep";
 import { sessionStart } from "./session-start";
 import { runMcpServer } from "./vendor/mnemopi/mcp-server";
 import { handleToolCall } from "./vendor/mnemopi/mcp-tools";
 
 function usage(): never {
-	console.error("usage: shared-memory <mcp|context|call TOOL JSON|session-start|startup|review|review-sweep> [--cwd ABS]");
+	console.error("usage: shared-memory <mcp|context|call TOOL JSON|session-start|startup|review|review-sweep|changelog-install|changelog-uninstall> [--cwd ABS]");
 	process.exit(2);
 }
 
@@ -109,7 +112,8 @@ function printJson(value: unknown): void {
 function sweepSummary(result: LockedReviewResult): Record<string, unknown> {
 	const report = result.review?.report;
 	const counts = report ? Object.fromEntries(Object.entries(report).flatMap(([key, value]) => Array.isArray(value) ? [[key, value.length]] : [])) : undefined;
-	return { status: result.status, reason: result.reason, error: result.error, snapshotPath: result.review?.snapshotPath, ...(counts ? { report: counts } : {}) };
+	const install = result.install ? { installed: result.install.installed.length, present: result.install.present.length, busy: result.install.busy, failed: result.install.failed } : undefined;
+	return { status: result.status, reason: result.reason, error: result.error, markerPath: result.review?.markerPath, ...(install ? { install } : {}), ...(counts ? { report: counts } : {}) };
 }
 
 function runReviewSweep(context: AdapterContext): void {
@@ -165,7 +169,7 @@ async function main(argv: readonly string[]): Promise<void> {
 			const cwd = hookCwd(argv.slice(1), input);
 			const context = contextForCwd(cwd);
 			configureRuntime(context);
-			printJson(await sessionStart(cwd, { harness: hostArg(argv.slice(1)), launchReviewSweep }));
+			printJson(await sessionStart(cwd, { harness: hostArg(argv.slice(1)), launchReviewSweep, launchChangeLogInstall }));
 		} catch (error) {
 			printJson(startupError(error instanceof Error ? error.message : String(error)));
 			process.exitCode = 1;
@@ -176,6 +180,25 @@ async function main(argv: readonly string[]): Promise<void> {
 		const context = contextForCwd(cwdArg(argv.slice(1)));
 		configureRuntime(context);
 		runReviewSweep(context);
+		return;
+	}
+	if (mode === "changelog-install") {
+		const context = contextForCwd(cwdArg(argv.slice(1)));
+		const now = new Date();
+		// When startup launched this, banks still backing off wait for their retry time
+		// or the weekly review; run by hand, it retries every bank.
+		const fromStartup = argv.includes("--from-startup");
+		const summary = installChangeLogAll(context, fromStartup ? { skipFailedBefore: { failure: readInstallFailure(context), now } } : {});
+		recordInstallOutcome(context, summary, now);
+		printJson(summary);
+		if (summary.failed.length > 0) process.exitCode = 1;
+		return;
+	}
+	if (mode === "changelog-uninstall") {
+		const context = contextForCwd(cwdArg(argv.slice(1)));
+		const results = listBanks(context).map(({ bank, dbPath }) => ({ bank, ...uninstallChangeLog(dbPath) }));
+		printJson(results);
+		if (results.some(result => result.status !== "uninstalled" && result.status !== "absent")) process.exitCode = 1;
 		return;
 	}
 	if (mode === "review") {
